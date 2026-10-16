@@ -110,6 +110,15 @@ export function loadState(now: number): State {
   }
 }
 
+/** Whether this browser storage holds a saved state (if not, the backup file may). */
+export function hasSavedState(): boolean {
+  try {
+    return localStorage.getItem(STORAGE_KEY) !== null;
+  } catch {
+    return false;
+  }
+}
+
 export function saveState(s: State): void {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(s));

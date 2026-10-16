@@ -53,8 +53,12 @@ pub fn app_name(path: &str) -> String {
     path.rsplit(['\\', '/']).next().unwrap_or(path).to_lowercase()
 }
 
-/// A blocked program first gets this long to close its windows by itself (and save), then it is ended.
+/// A blocked program first gets this long to close its windows by itself, then it is ended.
 pub const GRACE_MS: f64 = 4_000.0;
+
+/// A blocked program that still shows a window after being asked to close (most likely "Save changes?")
+/// gets this long, so the user can answer it and nothing is lost.
+pub const GRACE_WINDOW_MS: f64 = 20_000.0;
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum Action {
@@ -64,7 +68,8 @@ pub enum Action {
     Kill(u32, String),
 }
 
-/// Closes blocked programs: first politely, after `GRACE_MS` for good.
+/// Closes blocked programs: first politely, then for good after `GRACE_MS`, or `GRACE_WINDOW_MS` while
+/// the program still shows a window.
 #[derive(Default)]
 pub struct Enforcer {
     /// Processes already asked to close: pid → (program, when).
@@ -72,8 +77,9 @@ pub struct Enforcer {
 }
 
 impl Enforcer {
-    /// One look at the running processes (`pid`, program). `own_pid` is Modes itself.
-    pub fn step(&mut self, now: f64, procs: &[(u32, String)], blocked: &HashSet<String>, own_pid: u32) -> Vec<Action> {
+    /// One look at the running processes (`pid`, program). `own_pid` is Modes itself; `windowed` are the
+    /// processes that show a visible window now.
+    pub fn step(&mut self, now: f64, procs: &[(u32, String)], blocked: &HashSet<String>, own_pid: u32, windowed: &HashSet<u32>) -> Vec<Action> {
         let mut out = Vec::new();
         let mut seen = HashSet::new();
         for (pid, app) in procs {
@@ -85,7 +91,8 @@ impl Enforcer {
             match self.asked.get(pid) {
                 // A pid can be reused by another program: then it is a new process.
                 Some((a, at)) if a == app => {
-                    if now - at >= GRACE_MS {
+                    let grace = if windowed.contains(pid) { GRACE_WINDOW_MS } else { GRACE_MS };
+                    if now - at >= grace {
                         out.push(Action::Kill(*pid, app.clone()));
                     }
                 }
@@ -225,6 +232,10 @@ mod tests {
         names.iter().map(|s| s.to_string()).collect()
     }
 
+    fn none() -> HashSet<u32> {
+        HashSet::new()
+    }
+
     fn procs(list: &[(u32, &str)]) -> Vec<(u32, String)> {
         list.iter().map(|(p, a)| (*p, a.to_string())).collect()
     }
@@ -234,15 +245,32 @@ mod tests {
         let mut e = Enforcer::default();
         let blocked = set(&["steam.exe"]);
         let ps = procs(&[(10, "steam.exe"), (11, "code.exe")]);
-        assert_eq!(e.step(0.0, &ps, &blocked, 1), vec![Action::Close(10, "steam.exe".into())]);
-        assert!(e.step(1_000.0, &ps, &blocked, 1).is_empty());
-        assert_eq!(e.step(GRACE_MS, &ps, &blocked, 1), vec![Action::Kill(10, "steam.exe".into())]);
+        assert_eq!(e.step(0.0, &ps, &blocked, 1, &none()), vec![Action::Close(10, "steam.exe".into())]);
+        assert!(e.step(1_000.0, &ps, &blocked, 1, &none()).is_empty());
+        assert_eq!(e.step(GRACE_MS, &ps, &blocked, 1, &none()), vec![Action::Kill(10, "steam.exe".into())]);
         // It closed: a new start is asked again first.
-        assert!(e.step(5_000.0, &procs(&[(11, "code.exe")]), &blocked, 1).is_empty());
+        assert!(e.step(5_000.0, &procs(&[(11, "code.exe")]), &blocked, 1, &none()).is_empty());
         assert_eq!(
-            e.step(6_000.0, &procs(&[(12, "steam.exe")]), &blocked, 1),
+            e.step(6_000.0, &procs(&[(12, "steam.exe")]), &blocked, 1, &none()),
             vec![Action::Close(12, "steam.exe".into())]
         );
+    }
+
+    #[test]
+    fn waits_longer_while_the_program_still_shows_a_window() {
+        let mut e = Enforcer::default();
+        let blocked = set(&["word.exe"]);
+        let ps = procs(&[(40, "word.exe")]);
+        let open: HashSet<u32> = [40].into();
+        assert_eq!(e.step(0.0, &ps, &blocked, 1, &open), vec![Action::Close(40, "word.exe".into())]);
+        // "Save changes?" is showing: not ended after the short grace time.
+        assert!(e.step(GRACE_MS, &ps, &blocked, 1, &open).is_empty());
+        assert!(e.step(GRACE_WINDOW_MS - 1.0, &ps, &blocked, 1, &open).is_empty());
+        assert_eq!(e.step(GRACE_WINDOW_MS, &ps, &blocked, 1, &open), vec![Action::Kill(40, "word.exe".into())]);
+        // Its window is gone but the process is still there (hiding in the tray): ended at once.
+        let mut e = Enforcer::default();
+        e.step(0.0, &ps, &blocked, 1, &open);
+        assert_eq!(e.step(GRACE_MS, &ps, &blocked, 1, &none()), vec![Action::Kill(40, "word.exe".into())]);
     }
 
     #[test]
@@ -250,19 +278,22 @@ mod tests {
         let mut e = Enforcer::default();
         let blocked = set(&["explorer.exe", "svchost.exe", "modes.exe", "game.exe"]);
         let ps = procs(&[(0, "game.exe"), (4, "system"), (20, "explorer.exe"), (21, "svchost.exe"), (22, "game.exe")]);
-        assert_eq!(e.step(0.0, &ps, &blocked, 22), vec![]);
+        assert_eq!(e.step(0.0, &ps, &blocked, 22, &none()), vec![]);
     }
 
     #[test]
     fn a_reused_pid_or_a_lifted_rule_starts_over() {
         let mut e = Enforcer::default();
         let blocked = set(&["a.exe", "b.exe"]);
-        e.step(0.0, &procs(&[(30, "a.exe")]), &blocked, 1);
-        assert_eq!(e.step(GRACE_MS, &procs(&[(30, "b.exe")]), &blocked, 1), vec![Action::Close(30, "b.exe".into())]);
-        // The rule is lifted: forgotten, and asked again only after it is blocked again.
-        assert!(e.step(GRACE_MS + 1.0, &procs(&[(30, "b.exe")]), &set(&[]), 1).is_empty());
+        e.step(0.0, &procs(&[(30, "a.exe")]), &blocked, 1, &none());
         assert_eq!(
-            e.step(GRACE_MS * 3.0, &procs(&[(30, "b.exe")]), &blocked, 1),
+            e.step(GRACE_MS, &procs(&[(30, "b.exe")]), &blocked, 1, &none()),
+            vec![Action::Close(30, "b.exe".into())]
+        );
+        // The rule is lifted: forgotten, and asked again only after it is blocked again.
+        assert!(e.step(GRACE_MS + 1.0, &procs(&[(30, "b.exe")]), &set(&[]), 1, &none()).is_empty());
+        assert_eq!(
+            e.step(GRACE_MS * 3.0, &procs(&[(30, "b.exe")]), &blocked, 1, &none()),
             vec![Action::Close(30, "b.exe".into())]
         );
     }

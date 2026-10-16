@@ -15,8 +15,28 @@ async function call<T>(cmd: string, args: Record<string, unknown>, fallback: T):
  * Tells Windows the mode: what to block (programs, and the title words of sites from `siteKeys`),
  * whether to count program time, and what the tray shows (`label` the mode's name, `status` its line).
  */
-export function setMode(mode: ModeId, label: string, status: string, blocked: string[], sites: string[], tracking: boolean): Promise<void> {
-  return call('set_mode', { mode, label, status, blocked, sites, tracking }, undefined);
+export function setMode(
+  mode: ModeId,
+  label: string,
+  status: string,
+  blocked: string[],
+  sites: string[],
+  tracking: boolean,
+  resume: Resume | null = null,
+): Promise<void> {
+  return call('set_mode', { mode, label, status, blocked, sites, tracking, resume }, undefined);
+}
+
+/**
+ * During a break: the work rules Windows puts back by itself at `at` (and says so), because this page's
+ * timers are slowed down while its window is hidden in the tray.
+ */
+export interface Resume {
+  at: number;
+  blocked: string[];
+  sites: string[];
+  status: string;
+  body: string;
 }
 
 /** A Windows notification (in a browser: nothing). */
@@ -73,7 +93,7 @@ export async function pickFile(): Promise<string | null> {
 }
 
 /** Listens to an event from Windows; returns the way to stop listening. */
-export function onNative(event: 'tray' | 'blocked', fn: (payload: string) => void): () => void {
+export function onNative(event: 'tray' | 'blocked' | 'break-over', fn: (payload: string) => void): () => void {
   if (!isDesktop) return () => {};
   let stop: (() => void) | null = null;
   let stopped = false;
@@ -104,4 +124,14 @@ export async function saveFile(name: string, contents: string): Promise<string> 
   a.click();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
   return name;
+}
+
+/** Keeps a copy of the state in a file in the app's data folder (nothing in a browser). */
+export function saveBackup(json: string): Promise<void> {
+  return call('save_backup', { json }, undefined);
+}
+
+/** The state copy saved by `saveBackup`, or null. */
+export function loadBackup(): Promise<string | null> {
+  return call('load_backup', {}, null);
 }

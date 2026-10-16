@@ -11,7 +11,7 @@ Two modes for one Windows PC: **WORK** and **FREE TIME**. Each mode has its own 
 - **Anywhere:** Ctrl+Alt+M starts or ends work; the tray shows the mode and your goal.
 - **LOG** shows the week (sessions, work time, time at the PC, a done score where partly counts half, and your streak: work days in a row with a session done), work per day for the last 7 days, and every session (each can be deleted). **EXPORT CSV** saves the whole log to Downloads, for a spreadsheet or as proof of the work.
 
-A blocked program is first asked to close, like clicking its X (so it can ask to save), and is ended 4 seconds later if it is still running. Programs run as administrator cannot be closed. Windows itself and Modes are never blocked.
+A blocked program is first asked to close, like clicking its X, and is ended 4 seconds later if it is still running; if it still shows a window (say "Save changes?"), it gets 20 seconds so you can answer it. Programs run as administrator cannot be closed. Windows itself and Modes are never blocked.
 
 A blocked site's tab is closed with Ctrl+W when it has been in front for 2 seconds in Chrome, Edge, Firefox, Brave, Opera, Vivaldi, Arc and other common browsers. Modes recognises it from the tab title ("Video - YouTube - Google Chrome"), so a page whose title does not name the site gets through, a page about YouTube on another site does not get closed, and a background tab playing audio is not touched.
 
@@ -21,7 +21,7 @@ Download `Modes-x.y.z-setup.exe` from **Releases**. It installs per-user, with n
 
 ## Privacy
 
-Everything stays on this PC (the app's local storage). Only program file names are measured, only during work. Browser tab titles are read only to find blocked sites, and never kept.
+Everything stays on this PC: the app's storage, with a copy in `%APPDATA%\com.naglimantas.modes\modes-state.json` that is restored if that storage is ever cleared. Only program file names are measured, only during work. Browser tab titles are read only to find blocked sites, and never kept.
 
 ## Develop
 

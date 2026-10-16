@@ -50,6 +50,32 @@ struct Shared {
     tracking: AtomicBool,
     /// When each program was last reported as closed.
     notified: Mutex<HashMap<String, f64>>,
+    /// During a break: what to block again when it ends. Rust switches it on itself, on time, because
+    /// the web app's timers are slowed down while its window is hidden in the tray.
+    resume: Mutex<Option<Resume>>,
+}
+
+/// The work rules to put back when a break ends at `at` (ms since the epoch).
+#[derive(serde::Deserialize, Clone, Debug)]
+struct Resume {
+    at: f64,
+    blocked: Vec<String>,
+    sites: Vec<String>,
+    status: String,
+    /// The notification's text, e.g. "Back to: Write the release notes".
+    body: String,
+}
+
+fn set_lists(state: &Shared, blocked: &[String], sites: &[String], status: &str) {
+    if let Ok(mut b) = state.blocked.lock() {
+        *b = blocked.iter().map(|b| b.to_lowercase()).filter(|b| !rules::protected(b)).collect();
+    }
+    if let Ok(mut s) = state.sites.lock() {
+        *s = sites.iter().map(|k| k.to_lowercase()).filter(|k| !k.is_empty()).collect();
+    }
+    if let Ok(mut s) = state.status.lock() {
+        *s = status.to_string();
+    }
 }
 
 /// The web app's mode, after every change: what to block, whether to count program time, and what
@@ -64,19 +90,14 @@ fn set_mode(
     blocked: Vec<String>,
     sites: Vec<String>,
     tracking: bool,
+    resume: Option<Resume>,
     state: State<'_, Shared>,
 ) -> Result<(), String> {
-    let set: HashSet<String> = blocked.iter().map(|b| b.to_lowercase()).filter(|b| !rules::protected(b)).collect();
-    if let Ok(mut b) = state.blocked.lock() {
-        *b = set;
-    }
-    if let Ok(mut s) = state.sites.lock() {
-        *s = sites.iter().map(|k| k.to_lowercase()).filter(|k| !k.is_empty()).collect();
-    }
-    if let Ok(mut s) = state.status.lock() {
-        *s = status.clone();
-    }
+    set_lists(&state, &blocked, &sites, &status);
     state.tracking.store(tracking, Ordering::Relaxed);
+    if let Ok(mut r) = state.resume.lock() {
+        *r = resume;
+    }
     let changed = state.mode.lock().map(|mut m| std::mem::replace(&mut *m, mode.clone()) != mode).unwrap_or(true);
     if let Ok(mut l) = state.label.lock() {
         *l = label.clone();
@@ -136,6 +157,28 @@ fn export_file(app: AppHandle, name: String, contents: String) -> Result<String,
     bytes.extend_from_slice(contents.as_bytes());
     std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
     Ok(path.display().to_string())
+}
+
+fn backup_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir.join("modes-state.json"))
+}
+
+/// Keeps a copy of the web app's state in a file, so the log survives if the WebView's storage is
+/// cleared. Written to a temporary file first, so a crash never leaves half a file.
+#[tauri::command]
+fn save_backup(app: AppHandle, json: String) -> Result<(), String> {
+    let path = backup_path(&app)?;
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, json).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())
+}
+
+/// The state saved by `save_backup`, if there is one.
+#[tauri::command]
+fn load_backup(app: AppHandle) -> Option<String> {
+    std::fs::read_to_string(backup_path(&app).ok()?).ok()
 }
 
 /// Brings the window forward (the schedule asks something).
@@ -337,6 +380,20 @@ fn start_thread(app: AppHandle) {
             let state = app.state::<Shared>();
             let now = now_ms();
 
+            // A break is over: work's rules are back, even if the web app is asleep in the tray.
+            let due = state
+                .resume
+                .lock()
+                .ok()
+                .and_then(|mut r| if r.as_ref().is_some_and(|r| now >= r.at) { r.take() } else { None });
+            if let Some(r) = due {
+                set_lists(&state, &r.blocked, &r.sites, &r.status);
+                state.tracking.store(true, Ordering::Relaxed);
+                let _ = update_tray(&app, "work", &r.status);
+                let _ = app.emit("break-over", ());
+                let _ = app.notification().builder().title("Break over").body(&r.body).show();
+            }
+
             let tracking = state.tracking.load(Ordering::Relaxed);
             let sites = state.sites.lock().map(|s| s.clone()).unwrap_or_default();
             // Titles are read only to find blocked sites, never kept.
@@ -376,7 +433,7 @@ fn start_thread(app: AppHandle) {
             }
             let procs = win::processes();
             let actions = match state.enforcer.lock() {
-                Ok(mut e) => e.step(now, &procs, &blocked, own_pid),
+                Ok(mut e) => e.step(now, &procs, &blocked, own_pid, &win::windowed_pids()),
                 Err(_) => continue,
             };
             let mut closed = Vec::new();
@@ -429,7 +486,9 @@ pub fn run() {
             started_at_login,
             notify,
             show_window,
-            export_file
+            export_file,
+            save_backup,
+            load_backup
         ])
         .setup(|app| {
             setup_tray(app.handle())?;

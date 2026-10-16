@@ -94,12 +94,18 @@ mod imp {
         1
     }
 
-    /// Programs that have a visible, titled window right now: what the user would want to pick from.
-    pub fn windowed() -> Vec<String> {
+    /// The processes that show a visible, titled window right now.
+    pub fn windowed_pids() -> HashSet<u32> {
         let mut pids: HashSet<u32> = HashSet::new();
         unsafe {
             EnumWindows(Some(collect_pid), &mut pids as *mut HashSet<u32> as LPARAM);
         }
+        pids
+    }
+
+    /// Programs that have a visible, titled window right now: what the user would want to pick from.
+    pub fn windowed() -> Vec<String> {
+        let pids = windowed_pids();
         processes().into_iter().filter(|(pid, _)| pids.contains(pid)).map(|(_, app)| app).collect()
     }
 
@@ -266,7 +272,7 @@ mod tests {
         let blocked: HashSet<String> = ["ping.exe".to_string()].into();
         let mut e = Enforcer::default();
         let own = std::process::id();
-        let first = e.step(0.0, &processes(), &blocked, own);
+        let first = e.step(0.0, &processes(), &blocked, own, &windowed_pids());
         assert!(first.contains(&Action::Close(pid, "ping.exe".into())), "{first:?}");
         for a in &first {
             if let Action::Close(p, _) = a {
@@ -274,7 +280,7 @@ mod tests {
             }
         }
         // A console program has no window to close: it is still there, and is ended after the grace time.
-        let later = e.step(GRACE_MS, &processes(), &blocked, own);
+        let later = e.step(GRACE_MS, &processes(), &blocked, own, &windowed_pids());
         assert!(later.contains(&Action::Kill(pid, "ping.exe".into())), "{later:?}");
         for a in later {
             if let Action::Kill(p, _) = a {
@@ -295,8 +301,11 @@ mod tests {
             eprintln!("no notepad window appeared (no interactive desktop?): window closing not checked");
             return;
         }
+        // The enforcer waits longer for a program that still shows a window ("Save changes?").
+        assert!(windowed_pids().contains(&pid), "notepad's window is seen by its process id");
         close(pid);
         assert!(exited(&mut child, 10), "notepad closed on WM_CLOSE");
+        assert!(wait_for(5, || !windowed_pids().contains(&pid)));
     }
 
     #[test]
@@ -318,7 +327,7 @@ mod tests {
 }
 
 #[cfg(windows)]
-pub use imp::{close, close_tab, front_window, idle_ms, kill, open, processes, windowed};
+pub use imp::{close, close_tab, front_window, idle_ms, kill, open, processes, windowed, windowed_pids};
 
 #[cfg(not(windows))]
 pub fn processes() -> Vec<(u32, String)> {
@@ -330,6 +339,11 @@ pub fn close(_pid: u32) {}
 
 #[cfg(not(windows))]
 pub fn kill(_pid: u32) {}
+
+#[cfg(not(windows))]
+pub fn windowed_pids() -> std::collections::HashSet<u32> {
+    std::collections::HashSet::new()
+}
 
 #[cfg(not(windows))]
 pub fn windowed() -> Vec<String> {

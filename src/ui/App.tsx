@@ -21,8 +21,8 @@ import {
   type State,
 } from '../core/model';
 import { shortName, siteKeys } from '../core/programs';
-import { loadState, saveState } from '../core/store';
-import { notify, onNative, openItem, saveFile, setAutostart, setMode, showWindow, startedAtLogin, takeUsage } from '../platform/native';
+import { hasSavedState, loadState, parseState, saveState } from '../core/store';
+import { loadBackup, notify, onNative, openItem, saveBackup, saveFile, setAutostart, setMode, showWindow, startedAtLogin, takeUsage } from '../platform/native';
 import { toCsv } from '../core/export';
 import { fmtTime } from '../core/stats';
 import { CheckOutDialog, StartWorkDialog } from './dialogs';
@@ -63,30 +63,59 @@ export function App() {
   const dialogRef = useRef(dialog);
   dialogRef.current = dialog;
 
-  // Every change is saved at once, so a crash or shutdown loses nothing.
-  useEffect(() => saveState(s), [s]);
+  // Every change is saved at once, so a crash or shutdown loses nothing; a copy goes to a file in the
+  // app's data folder a moment later (in case the WebView's storage is ever cleared).
+  const [restored, setRestored] = useState(() => hasSavedState());
+  useEffect(() => {
+    saveState(s);
+    if (!restored) return;
+    const id = setTimeout(() => void saveBackup(JSON.stringify(s)).catch(() => {}), 1500);
+    return () => clearTimeout(id);
+  }, [s, restored]);
+
+  // Storage empty (first start, or cleared): take the backup file if there is one.
+  useEffect(() => {
+    if (restored) return;
+    loadBackup()
+      .then((json) => {
+        if (json) {
+          const back = parseState(json, Date.now());
+          latest.current = back;
+          setS(back);
+          if (back.log.length) toast(`Restored ${back.log.length} session${back.log.length === 1 ? '' : 's'} from the backup file.`);
+        }
+      })
+      .catch(() => {})
+      .finally(() => setRestored(true));
+  }, [restored]);
 
   // Windows follows the mode: what to block, whether to count program time, what the tray says.
   // During a break nothing is blocked or measured.
   const rules = s.rules[s.mode];
-  const onBreak = !!s.current?.onBreak;
-  const blockedKey = onBreak ? '' : rules.blocked.join('|');
-  const sitesKey = onBreak ? '' : rules.sites.join('|');
+  const breakUntil = s.current?.onBreak?.until ?? 0;
+  const goal = s.current?.goal ?? '';
+  const blockedKey = rules.blocked.join('|');
+  const sitesKey = rules.sites.join('|');
   const status = trayStatus(s);
   useEffect(() => {
     const blocked = blockedKey ? blockedKey.split('|') : [];
     const sites = sitesKey ? sitesKey.split('|').flatMap(siteKeys) : [];
-    setMode(s.mode, MODE_NAME[s.mode], status, blocked, sites, s.mode === 'work' && !onBreak).catch((e) => toast(`Windows side: ${String(e)}`, 'warn'));
-  }, [s.mode, blockedKey, sitesKey, status, onBreak]);
+    const work = s.mode === 'work';
+    const failed = (e: unknown) => toast(`Windows side: ${String(e)}`, 'warn');
+    if (work && breakUntil) {
+      const resume = { at: breakUntil, blocked, sites, status: `WORK: ${goal}`, body: `Back to: ${goal}` };
+      setMode(s.mode, MODE_NAME[s.mode], status, [], [], false, resume).catch(failed);
+    } else {
+      setMode(s.mode, MODE_NAME[s.mode], status, blocked, sites, work).catch(failed);
+    }
+  }, [s.mode, blockedKey, sitesKey, status, breakUntil, goal]);
 
-  // A break whose time is up ends by itself, and says so.
+  // A break whose time is up ends by itself (Windows has put the rules back and notified already).
   useEffect(() => {
     const b = latest.current.current?.onBreak;
     if (!b || now < b.until) return;
     setS((x) => settleBreak(x, now));
-    const goal = latest.current.current?.goal ?? '';
     toast('Break over. Blocking is on again.');
-    void notify('Break over', `Back to: ${goal}`).catch(() => {});
   }, [now]);
 
   useEffect(() => {
@@ -213,6 +242,8 @@ export function App() {
         onSwitch();
       }
     });
+    // Sent when Windows ended a break on time; this page's own clock may be slowed down in the tray.
+    const c = onNative('break-over', () => setS((x) => settleBreak(x, Date.now())));
     const b = onNative('blocked', (name) => {
       const site = !name.endsWith('.exe');
       toast(site ? `${name} is blocked in ${MODE_NAME[latest.current.mode]}: tab closed.` : `${shortName(name)} is blocked in ${MODE_NAME[latest.current.mode]}: closing it.`, 'warn');
@@ -221,6 +252,7 @@ export function App() {
     return () => {
       a();
       b();
+      c();
     };
   }, [onSwitch]);
 
@@ -272,7 +304,7 @@ export function App() {
         ))}
         <span className={`mode-tag ${s.mode}`}>
           {MODE_NAME[s.mode]}
-          {onBreak ? ' · BREAK' : ''}
+          {breakUntil ? ' · BREAK' : ''}
         </span>
       </nav>
       <main>

@@ -41,6 +41,7 @@ function fakeTauri() {
       if (cmd === 'take_usage') return { 'code.exe': 9000 };
       if (cmd === 'started_at_login') return false;
       if (cmd === 'export_file') return `C:\\Users\\me\\Downloads\\${args.name}`;
+      if (cmd === 'load_backup') return window.__backup ?? null;
       return null;
     },
     metadata: { currentWindow: { label: 'main' }, currentWebview: { windowLabel: 'main', label: 'main' } },
@@ -52,9 +53,10 @@ const server = await preview({ preview: { port: PORT, strictPort: true }, logLev
 const browser = await chromium.launch({ executablePath: process.env.CHROMIUM_PATH || undefined });
 let failed = 0;
 
-async function scenario(name, { tauri = true, time = new Date(2026, 9, 14, 8, 58), viewport = { width: 1000, height: 640 } } = {}, fn) {
+async function scenario(name, { tauri = true, time = new Date(2026, 9, 14, 8, 58), viewport = { width: 1000, height: 640 }, backup = null } = {}, fn) {
   const ctx = await browser.newContext({ viewport, acceptDownloads: true });
   if (tauri) await ctx.addInitScript(fakeTauri);
+  if (backup) await ctx.addInitScript((b) => (window.__backup = b), backup);
   const p = await ctx.newPage();
   const errors = [];
   p.on('pageerror', (e) => errors.push(e.message));
@@ -187,10 +189,14 @@ await scenario('breaks pause blocking and end by themselves', {}, async (p) => {
   let m = await lastMode(p);
   assert.deepEqual([m.blocked, m.sites, m.tracking], [[], [], false], 'nothing blocked or measured on a break');
   assert.match(m.status, /on break until/);
+  // Windows is told what to put back, and when, so it happens on time even with this page asleep.
+  assert.ok(m.resume.blocked.includes('steam.exe'));
+  assert.equal(m.resume.status, 'WORK: Deep work');
+  assert.equal(m.resume.at, (await saved(p)).current.onBreak.until);
   await p.clock.runFor(10 * MIN + 2000);
   await p.getByText('Break over').first().waitFor();
-  assert.ok((await calls(p, 'notify')).some((c) => c.title === 'Break over'));
   m = await lastMode(p);
+  assert.equal(m.resume, null, 'resume cleared after the break');
   assert.equal(m.tracking, true);
   assert.ok(m.blocked.includes('steam.exe'), 'blocking back on');
   await p.getByRole('button', { name: '5 min', exact: true }).click();
@@ -206,6 +212,51 @@ await scenario('breaks pause blocking and end by themselves', {}, async (p) => {
   assert.equal(w.breaks.length, 2);
   // The fake clock also runs in real time between steps: allow a second.
   assert.ok(Math.abs(w.breaks.reduce((a, b) => a + b.to - b.from, 0) - 12 * MIN) < 1000, 'breaks add up to 12 min');
+});
+
+await scenario('Windows ends a break while the page is asleep', {}, async (p) => {
+  await startWork(p, 'Deep work');
+  await p.getByRole('button', { name: '5 min', exact: true }).click();
+  await p.getByText('ON BREAK').waitFor();
+  // Only the clock moves (no timers run), then Windows says the break is over.
+  const t = await p.evaluate(() => Date.now());
+  await p.clock.setSystemTime(t + 6 * MIN);
+  await p.evaluate(() => window.__emit('break-over', null));
+  await p.getByText('ON BREAK').waitFor({ state: 'detached' });
+  const w = (await saved(p)).current;
+  assert.equal(w.breaks.length, 1);
+  assert.ok(Math.abs(w.breaks[0].to - w.breaks[0].from - 5 * MIN) < 1000, 'ended at its planned end, not later');
+});
+
+const BACKUP = JSON.stringify({
+  v: 1,
+  mode: 'free',
+  since: 0,
+  rules: { work: { blocked: ['steam.exe'], sites: ['reddit.com'], startup: [] }, free: { blocked: [], sites: [], startup: [] } },
+  current: null,
+  log: [{ id: 'old', start: new Date(2026, 9, 13, 10).getTime(), end: new Date(2026, 9, 13, 11).getTime(), goal: 'From the backup', outcome: 'done', next: 'Keep going', usage: {}, tries: {}, breaks: [] }],
+  settings: {},
+  guideDone: true,
+});
+
+await scenario('cleared storage comes back from the backup file', { backup: BACKUP }, async (p) => {
+  await p.getByText('Restored 1 session from the backup file').waitFor();
+  const s = await saved(p);
+  assert.equal(s.log[0].goal, 'From the backup');
+  assert.deepEqual(s.rules.work.sites, ['reddit.com']);
+  await p.getByText('START WORK…').click();
+  assert.equal(await p.getByPlaceholder(GOAL).inputValue(), 'Keep going');
+  await p.keyboard.press('Escape');
+  // Changes are copied to the file a moment later.
+  await p.clock.runFor(2000);
+  const last = (await calls(p, 'save_backup')).at(-1);
+  assert.equal(JSON.parse(last.json).log[0].goal, 'From the backup');
+});
+
+await scenario('a fresh start never overwrites the backup before reading it', {}, async (p) => {
+  await p.clock.runFor(3000);
+  const order = await p.evaluate(() => window.__calls.map((c) => c[0]).filter((c) => c === 'load_backup' || c === 'save_backup'));
+  assert.equal(order[0], 'load_backup');
 });
 
 await scenario('log: chart, streak, export, delete', {}, async (p) => {
