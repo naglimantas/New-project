@@ -1,12 +1,12 @@
 import { useEffect, useState } from 'react';
-import { activeMs, GOAL_MAX, MODE_NAME, OUTCOME_NAME, type ModeId, type Outcome, type State } from '../core/model';
+import { activeMs, GOAL_MAX, LOCKS, MODE_NAME, OUTCOME_NAME, type ModeId, type Outcome, type State } from '../core/model';
 import { shortName } from '../core/programs';
-import { fmtDuration } from '../core/stats';
+import { fmtDuration, fmtTime } from '../core/stats';
 import { runningBlocked } from '../platform/native';
 import { Window } from './kit';
-import { UsageList } from './Usage';
+import { Tries, UsageList } from './Usage';
 
-/** "Steam and Discord will be closed": the programs of the next mode's blocklist that run now. */
+/** What switching to `to` will do: running programs it closes, site tabs it closes, items it opens. */
 function WillClose({ s, to }: { s: State; to: ModeId }) {
   const [names, setNames] = useState<string[]>([]);
   const blocked = s.rules[to].blocked;
@@ -19,15 +19,13 @@ function WillClose({ s, to }: { s: State; to: ModeId }) {
       live = false;
     };
   }, [blocked]);
+  const sites = s.rules[to].sites;
   const opens = s.settings.openStartup ? s.rules[to].startup.length : 0;
-  if (!names.length && !opens) return null;
+  if (!names.length && !opens && !sites.length) return null;
   return (
     <div className="notes">
-      {names.length > 0 && (
-        <p className="warn">
-          Will be closed: {names.map(shortName).join(', ')}. Save your work there first.
-        </p>
-      )}
+      {names.length > 0 && <p className="warn">Will be closed: {names.map(shortName).join(', ')}. Save your work there first.</p>}
+      {sites.length > 0 && <p className="dim">Tabs of {sites.join(', ')} get closed while they are in front.</p>}
       {opens > 0 && (
         <p className="dim">
           Opens {opens} startup item{opens === 1 ? '' : 's'} for {MODE_NAME[to]}.
@@ -37,10 +35,21 @@ function WillClose({ s, to }: { s: State; to: ModeId }) {
   );
 }
 
-export function StartWorkDialog({ s, suggestion, onStart, onClose }: { s: State; suggestion: string; onStart: (goal: string) => void; onClose: () => void }) {
+export function StartWorkDialog({
+  s,
+  suggestion,
+  onStart,
+  onClose,
+}: {
+  s: State;
+  suggestion: string;
+  onStart: (goal: string, lockMin: number) => void;
+  onClose: () => void;
+}) {
   const [goal, setGoal] = useState(suggestion);
+  const [lock, setLock] = useState(0);
   const ok = goal.trim().length > 0;
-  const submit = () => ok && onStart(goal);
+  const submit = () => ok && onStart(goal, lock);
   return (
     <Window
       title="START WORK"
@@ -73,8 +82,16 @@ export function StartWorkDialog({ s, suggestion, onStart, onClose }: { s: State;
           }}
         />
       </label>
-      {suggestion && <p className="dim small">Filled in from your last check-out.</p>}
-      <p className="dim small">One concrete outcome works best. You will be asked about it when work ends.</p>
+      <p className="dim small">{suggestion ? 'Filled in from your last check-out. ' : ''}One concrete outcome works best. You will be asked about it when work ends.</p>
+      <p className="label">FOCUS LOCK</p>
+      <div className="choices four" role="radiogroup" aria-label="Focus lock">
+        {LOCKS.map((m) => (
+          <button key={m} role="radio" aria-checked={lock === m} className={`btn ${lock === m ? 'pressed' : ''}`} onClick={() => setLock(m)}>
+            {m ? `${m} min` : 'Off'}
+          </button>
+        ))}
+      </div>
+      <p className="dim small">{lock ? `Work cannot be ended for ${lock} minutes (only cancelled in the first 2).` : 'End work whenever you like.'}</p>
       <WillClose s={s} to="work" />
     </Window>
   );
@@ -84,6 +101,7 @@ export function CheckOutDialog({
   s,
   now,
   canCancel,
+  locked,
   onDone,
   onCancelWork,
   onClose,
@@ -91,6 +109,7 @@ export function CheckOutDialog({
   s: State;
   now: number;
   canCancel: boolean;
+  locked: boolean;
   onDone: (outcome: Outcome, next: string) => void;
   onCancelWork: () => void;
   onClose: () => void;
@@ -100,7 +119,7 @@ export function CheckOutDialog({
   const [skipping, setSkipping] = useState(false);
   const w = s.current;
   if (!w) return null;
-  const submit = () => outcome && onDone(outcome, next);
+  const submit = () => outcome && !locked && onDone(outcome, next);
   const choices: Outcome[] = ['done', 'partly', 'not'];
   return (
     <Window
@@ -112,7 +131,7 @@ export function CheckOutDialog({
             <button className="btn ghost left" onClick={onCancelWork} title="Started by mistake: leave work without a log entry">
               Started by mistake
             </button>
-          ) : skipping ? (
+          ) : locked ? null : skipping ? (
             <button className="btn ghost danger left" onClick={() => onDone('skipped', '')}>
               Really skip (it is logged)
             </button>
@@ -124,12 +143,17 @@ export function CheckOutDialog({
           <button className="btn ghost" onClick={onClose}>
             Keep working
           </button>
-          <button className="btn primary" disabled={!outcome} onClick={submit}>
+          <button className="btn primary" disabled={!outcome || locked} onClick={submit}>
             END WORK
           </button>
         </>
       }
     >
+      {locked && w.lockUntil && (
+        <p className="lock-note">
+          Focus lock: work can end at {fmtTime(w.lockUntil)}, in {fmtDuration(w.lockUntil - now)}.
+        </p>
+      )}
       <p className="label">GOAL</p>
       <p className="goal">{w.goal}</p>
       <p className="dim small">
@@ -137,10 +161,18 @@ export function CheckOutDialog({
       </p>
       <p className="label">WHERE THE TIME WENT</p>
       <UsageList usage={w.usage} />
+      <Tries tries={w.tries} />
       <p className="label">DID YOU GET IT DONE?</p>
       <div className="choices" role="radiogroup" aria-label="Did you get it done?">
         {choices.map((o, i) => (
-          <button key={o} data-autofocus={i === 0 ? '' : undefined} role="radio" aria-checked={outcome === o} className={`btn ${outcome === o ? 'pressed' : ''}`} onClick={() => setOutcome(o)}>
+          <button
+            key={o}
+            data-autofocus={i === 0 ? '' : undefined}
+            role="radio"
+            aria-checked={outcome === o}
+            className={`btn ${outcome === o ? 'pressed' : ''}`}
+            onClick={() => setOutcome(o)}
+          >
             {OUTCOME_NAME[o]}
           </button>
         ))}

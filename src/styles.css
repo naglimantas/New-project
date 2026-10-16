@@ -650,3 +650,116 @@ input::placeholder {
     transition-duration: 0s !important;
   }
 }
+
+/* ───────── round 2: guide, lock, sites, schedule, chart ───────── */
+.guide {
+  margin: 0 0 8px;
+  padding-left: 20px;
+  display: grid;
+  gap: 4px;
+}
+.guide b {
+  color: var(--hi);
+  font-weight: 500;
+}
+
+.btn.lg .kbd {
+  margin-left: 12px;
+  font-size: 11px;
+  opacity: 0.6;
+  font-weight: 400;
+}
+
+.lock-note {
+  margin: 10px 0 0;
+  padding: 6px 10px;
+  border-left: 2px solid var(--accent);
+  background: var(--raised);
+}
+.window .lock-note {
+  margin: 0 0 12px;
+}
+
+.chip.site {
+  border-style: dashed;
+}
+
+.choices.four {
+  grid-template-columns: repeat(4, 1fr);
+}
+
+.tries {
+  margin: 8px 0 0;
+}
+
+.schedule {
+  margin: 0 0 12px 24px;
+  display: grid;
+  gap: 8px;
+}
+.schedule.off {
+  opacity: 0.5;
+}
+.row.times {
+  margin: 0;
+  align-items: center;
+}
+.row.times input {
+  flex: 0 0 auto;
+  width: auto;
+}
+
+.chart {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 8px;
+  height: 150px;
+}
+.chart .col {
+  display: grid;
+  grid-template-rows: 1fr auto;
+  gap: 4px;
+  min-width: 0;
+  cursor: default;
+}
+.chart .val {
+  position: absolute;
+  left: 0;
+  right: 0;
+  padding-bottom: 3px;
+  font-size: 11px;
+  color: var(--dim);
+  text-align: center;
+  white-space: nowrap;
+}
+.chart .track {
+  position: relative;
+  border-bottom: 1px solid var(--line-strong);
+  /* Room for the value label over the tallest bar. */
+  margin-top: 18px;
+}
+.chart .fill {
+  position: absolute;
+  left: 18%;
+  right: 18%;
+  bottom: 0;
+  background: var(--work);
+  transition: height var(--t) var(--ease);
+}
+.chart .col:hover .fill {
+  background: var(--hi);
+}
+.chart .col:hover .val {
+  color: var(--fg);
+}
+.chart .day {
+  font-size: 11px;
+  color: var(--dim);
+  text-align: center;
+}
+
+.entry-tools {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}

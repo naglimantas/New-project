@@ -11,25 +11,28 @@ A sibling of TimeTrack (`naglimantas/time-tracker`): same stack, same look, same
 
 ## Model (`src/core/`)
 
-- `State` (`model.ts`): `mode` (`work` | `free`), `since`, per-mode `rules` (`blocked` exe names, sorted, lower case; `startup` items `{target, args}`), `current` (the running `WorkSession`, only in work), `log` (finished sessions, newest first, max 1000), `settings` (`autostart`, `openStartup`).
-- All changes are pure functions with explicit `now`: `startWork` (needs a goal), `checkOut` (outcome `done` | `partly` | `not` | `skipped` plus next step), `cancelWork` (only in the first 2 min, no log entry), `addUsage`, `setRules`. `suggestedGoal` is the last non-skipped next step.
+- `State` (`model.ts`): `mode` (`work` | `free`), `since`, per-mode `rules` (`blocked` exe names, sorted, lower case; `sites` hosts like `youtube.com`, sorted; `startup` items `{target, args}`), `current` (the running `WorkSession`, only in work: `usage`, `tries` per blocked program or site, `lockUntil`), `log` (finished sessions, newest first, max 1000), `settings` (`autostart`, `openStartup`, `schedule` {on, days 0–6, start/end minutes, start < end}), `prompted` (the day each schedule prompt last came), `guideDone`.
+- All changes are pure functions with explicit `now`: `startWork` (needs a goal; optional lock minutes from `LOCKS`; marks today's start prompt as done), `checkOut` (outcome `done` | `partly` | `not` | `skipped` plus next step; refused while `isLocked`), `cancelWork` (only in the first 2 min, no log entry, allowed even when locked), `addUsage`, `addTry`, `deleteSession`, `setRules`, `markPrompted`. `suggestedGoal` is the last non-skipped next step.
+- `schedulePrompt`: `start` in free time inside work hours on a work day, once a day; `end` in work after the end time for work begun before it, once a day. The UI does not prompt while a dialog is open, and defers `end` while locked.
+- Sites (`programs.ts`): `normalizeSite` (scheme, www, path, port stripped) and `siteKeys` (the words a tab title shows: `youtube.com` → `youtube.com`, `youtube`; `bbc.co.uk` → also `bbc`; a subdomain only itself). Rust gets the keys, never hosts.
 - Saved in localStorage `modes-state` on every change and on `beforeunload`. `parseState` (`store.ts`) never throws: broken data falls back to defaults, work without a session becomes free time, protected names are dropped from blocklists.
 - `PROTECTED` exists twice and must stay the same: `src/core/programs.ts` and `src-tauri/src/rules.rs`. The app's own exe is `modes.exe` (`mainBinaryName`).
 
 ## Windows side (`src-tauri/src/`)
 
-- The web app owns the state; Rust only follows it. `set_mode` (mode, label, blocked, tracking) is sent after every mode or blocklist change.
-- One thread, every second: `Tally::tick` with the foreground program (only while tracking and not idle 5+ min; gaps over 5 s, overlays and `modes.exe` do not count). Every 2 s: `Enforcer::step` over all processes: `Close` (WM_CLOSE to visible top-level windows) first, `Kill` (TerminateProcess) after `GRACE_MS` (4 s). Closed programs emit `blocked` and, when the window is not in front, a notification (once per program per 20 s).
+- The web app owns the state; Rust only follows it. `set_mode` is sent after every mode, blocklist or goal change.
+- One thread, every second: the window in front (`front_window`; its title only when sites are blocked, never stored); `Tally::tick` with its program (only while tracking and not idle 5+ min; gaps over 5 s, overlays and `modes.exe` do not count); `SiteGuard::step` (not tied to idle: videos play without input): a browser (`BROWSERS`) whose title has a blocked site part (`site_in_title`: split on " - ", " | ", " / ", " : ", dashes and middle dots; "(3)" counts and Edge's "and 2 more pages" ignored) in the same window two ticks running gets `close_tab` (Ctrl+W via SendInput, only if still in front and no modifier is held). Every 2 s: `Enforcer::step` over all processes: `Close` (WM_CLOSE to visible top-level windows) first, `Kill` (TerminateProcess) after `GRACE_MS` (4 s). Closed programs and tabs emit `blocked` (exe name, or the site key) and, when the window is not in front, a notification (once per name per 20 s). The UI counts `blocked` as `tries` during work.
+- `set_mode(mode, label, status, blocked, sites, tracking)`; `status` is the tray's first line ("WORK: <goal>"). `notify` and `show_window` serve the schedule. Ctrl+Alt+M (global-shortcut plugin) and the tray's switch both call `ask_switch` (show window, emit `tray` `switch`; ignored by the UI while a dialog is open).
 - `take_usage` hands over the tally; the UI takes it every 10 s during work, right before check-out, and once at start (to drop stray time).
 - `open_item` uses ShellExecuteW (programs, shortcuts, files, folders, URLs). It is a sync command so it runs on the main thread.
 - The window starts hidden; it is shown unless started with `--minimized` (autostart). `started_at_login` lets the UI open the mode's startup items after login. Closing the window hides it. The tray menu: status, Start/End work (emits `tray` `switch`), Open, and Quit only outside work.
 
 ## UI (`src/ui/`)
 
-- Screens NOW, RULES, LOG (keys 1–3, not while typing). Dialogs: START WORK (goal, prefilled with `suggestedGoal`) and END WORK (goal, where the time went, outcome, next step). Both list the running programs the next mode will close.
-- During work the WORK blocklist can only grow (no × buttons).
+- Screens NOW (first-run guide until closed, lock note, tries), RULES (per mode: programs, sites, startup items; settings with work hours), LOG (week, a 7-day work chart (one series: no legend, hover titles; the session list is its table view), sessions with delete). Keys 1–3, not while typing. Dialogs: START WORK (goal prefilled with `suggestedGoal`, focus lock) and END WORK (lock note, goal, where the time went, tries, outcome, next step; while locked END is disabled and Skip hidden). Both list what the next mode will close and open.
+- During work the WORK blocklists can only grow (no × buttons).
 - Enter in a dialog input calls `preventDefault`: otherwise the same key press also clicks the button focus returns to when the dialog closes (found in testing: starting work opened END WORK).
-- Browser checks: `npx vite preview` and playwright-core with `executablePath: '/opt/pw-browsers/chromium'` in the cloud container. To seed localStorage, abort the app's scripts while writing it, or `beforeunload` saves the old state over it.
+- Browser checks: `npx vite preview` and playwright-core with `executablePath: '/opt/pw-browsers/chromium'` in the cloud container. To seed localStorage, abort the app's scripts while writing it, or `beforeunload` saves the old state over it. A fake `window.__TAURI_INTERNALS__` (record `invoke`; `transformCallback` plus `plugin:event|listen` handlers to emit `tray`/`blocked`) and `page.clock` cover the native calls, the lock and the schedule. Do not `pkill -f "vite preview"` from a shell whose own command line contains that text.
 
 ## Design rules (as TimeTrack)
 

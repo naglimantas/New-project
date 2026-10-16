@@ -72,3 +72,36 @@ export function fmtDay(t: number): string {
   const d = new Date(t);
   return `${DAYS[d.getDay()]} ${d.getDate()} ${MONTHS[d.getMonth()]}`;
 }
+
+export interface DayBar {
+  /** Local midnight. */
+  day: number;
+  /** Work time (start to check-out) of sessions that started that day. */
+  ms: number;
+  sessions: number;
+  done: number;
+}
+
+/** The last `n` days up to today, oldest first, for the LOG chart. */
+export function lastDays(log: WorkSession[], now: number, n = 7): DayBar[] {
+  const out: DayBar[] = [];
+  const today = new Date(now);
+  today.setHours(0, 0, 0, 0);
+  for (let i = n - 1; i >= 0; i--) {
+    const d = new Date(today);
+    d.setDate(d.getDate() - i);
+    out.push({ day: d.getTime(), ms: 0, sessions: 0, done: 0 });
+  }
+  const first = out[0].day;
+  for (const w of log) {
+    if (w.end === null || w.start < first || w.start > now) continue;
+    // The last day whose midnight is not after the start (days are not all 24 h long).
+    let k = out.length - 1;
+    while (k > 0 && out[k].day > w.start) k--;
+    const b = out[k];
+    b.ms += w.end - w.start;
+    b.sessions++;
+    if (w.outcome === 'done') b.done++;
+  }
+  return out;
+}

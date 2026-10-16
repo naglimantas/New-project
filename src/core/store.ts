@@ -1,8 +1,8 @@
 // Reading the saved state back. Anything missing or broken falls back to the defaults, so a damaged
 // file never stops the app from starting.
 
-import { GOAL_MAX, initialState, LOG_MAX, type ModeId, type ModeRules, type Outcome, type StartItem, type State, type WorkSession } from './model';
-import { isProtected, normalizeExe } from './programs';
+import { GOAL_MAX, initialState, LOG_MAX, type ModeId, type ModeRules, type Outcome, type Schedule, type StartItem, type State, type WorkSession } from './model';
+import { isProtected, normalizeExe, normalizeSite } from './programs';
 
 export const STORAGE_KEY = 'modes-state';
 
@@ -17,17 +17,29 @@ function readRules(x: unknown, fallback: ModeRules): ModeRules {
   const blocked = Array.isArray(x.blocked)
     ? [...new Set(x.blocked.map((b) => normalizeExe(str(b))).filter((b) => b.endsWith('.exe') && !isProtected(b)))].sort()
     : fallback.blocked;
+  const sites = Array.isArray(x.sites) ? [...new Set(x.sites.map((b) => normalizeSite(str(b))).filter(Boolean))].sort() : fallback.sites;
   const startup: StartItem[] = Array.isArray(x.startup)
     ? x.startup.filter(isObj).map((i) => ({ target: str(i.target).trim(), args: str(i.args).trim() })).filter((i) => i.target)
     : fallback.startup;
-  return { blocked, startup };
+  return { blocked, sites, startup };
 }
 
-function readUsage(x: unknown): Record<string, number> {
+/** Positive numbers by name (program time, tries). */
+function readCounts(x: unknown): Record<string, number> {
   const out: Record<string, number> = {};
   if (!isObj(x)) return out;
   for (const [k, v] of Object.entries(x)) if (k && num(v) && v > 0) out[k] = v;
   return out;
+}
+
+function readSchedule(x: unknown, fallback: Schedule): Schedule {
+  if (!isObj(x)) return fallback;
+  const minute = (v: unknown, d: number) => (num(v) && v >= 0 && v < 24 * 60 ? Math.round(v) : d);
+  let start = minute(x.start, fallback.start);
+  let end = minute(x.end, fallback.end);
+  if (start >= end) [start, end] = [fallback.start, fallback.end];
+  const days = Array.isArray(x.days) ? [...new Set(x.days.filter((d): d is number => Number.isInteger(d) && d >= 0 && d <= 6))].sort((a, b) => a - b) : fallback.days;
+  return { on: x.on === true, days, start, end };
 }
 
 function readSession(x: unknown, finished: boolean): WorkSession | null {
@@ -42,7 +54,9 @@ function readSession(x: unknown, finished: boolean): WorkSession | null {
     goal: str(x.goal, GOAL_MAX),
     outcome: finished ? outcome : null,
     next: str(x.next, GOAL_MAX),
-    usage: readUsage(x.usage),
+    usage: readCounts(x.usage),
+    tries: readCounts(x.tries),
+    lockUntil: !finished && num(x.lockUntil) ? x.lockUntil : null,
   };
 }
 
@@ -61,6 +75,7 @@ export function parseState(raw: string | null, now: number): State {
   // Work without a session (or a session outside work) cannot happen; if the file says so, trust the session.
   const mode: ModeId = current ? 'work' : 'free';
   const settings = isObj(x.settings) ? x.settings : {};
+  const prompted = isObj(x.prompted) ? x.prompted : {};
   return {
     v: 1,
     mode,
@@ -76,7 +91,10 @@ export function parseState(raw: string | null, now: number): State {
     settings: {
       autostart: typeof settings.autostart === 'boolean' ? settings.autostart : d.settings.autostart,
       openStartup: typeof settings.openStartup === 'boolean' ? settings.openStartup : d.settings.openStartup,
+      schedule: readSchedule(settings.schedule, d.settings.schedule),
     },
+    prompted: { start: str(prompted.start, 10), end: str(prompted.end, 10) },
+    guideDone: x.guideDone === true,
   };
 }
 

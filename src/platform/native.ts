@@ -11,9 +11,22 @@ async function call<T>(cmd: string, args: Record<string, unknown>, fallback: T):
   return invoke<T>(cmd, args);
 }
 
-/** Tells Windows the mode: what to block, whether to count program time, what the tray shows. */
-export function setMode(mode: ModeId, label: string, blocked: string[], tracking: boolean): Promise<void> {
-  return call('set_mode', { mode, label, blocked, tracking }, undefined);
+/**
+ * Tells Windows the mode: what to block (programs, and the title words of sites from `siteKeys`),
+ * whether to count program time, and what the tray shows (`label` the mode's name, `status` its line).
+ */
+export function setMode(mode: ModeId, label: string, status: string, blocked: string[], sites: string[], tracking: boolean): Promise<void> {
+  return call('set_mode', { mode, label, status, blocked, sites, tracking }, undefined);
+}
+
+/** A Windows notification (in a browser: nothing). */
+export function notify(title: string, body: string): Promise<void> {
+  return call('notify', { title, body }, undefined);
+}
+
+/** Brings the window forward. */
+export function showWindow(): Promise<void> {
+  return call('show_window', {}, undefined);
 }
 
 /** Which of these programs are running now. */

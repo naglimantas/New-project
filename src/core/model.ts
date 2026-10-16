@@ -12,6 +12,8 @@ export interface StartItem {
 export interface ModeRules {
   /** Program file names closed while the mode is on, lower case (`steam.exe`), sorted. */
   blocked: string[];
+  /** Sites whose browser tab is closed while the mode is on (`youtube.com`), sorted. */
+  sites: string[];
   startup: StartItem[];
 }
 
@@ -28,6 +30,20 @@ export interface WorkSession {
   next: string;
   /** Milliseconds each program was in front during the session (idle time is not counted). */
   usage: Record<string, number>;
+  /** How often each blocked program or site was opened and closed again. */
+  tries: Record<string, number>;
+  /** Work cannot be ended before this (a lock chosen at the start); null without one. */
+  lockUntil: number | null;
+}
+
+/** Work hours: Modes asks to start work at `start` and to check out at `end` on these days. */
+export interface Schedule {
+  on: boolean;
+  /** 0 = Sunday … 6 = Saturday, sorted. */
+  days: number[];
+  /** Minutes after midnight, `start < end`. */
+  start: number;
+  end: number;
 }
 
 export interface Settings {
@@ -35,6 +51,7 @@ export interface Settings {
   autostart: boolean;
   /** Open the mode's startup items when it starts. */
   openStartup: boolean;
+  schedule: Schedule;
 }
 
 export interface State {
@@ -48,6 +65,10 @@ export interface State {
   /** Finished work sessions, newest first. */
   log: WorkSession[];
   settings: Settings;
+  /** The day (`dayKey`) each schedule prompt last came, so it comes once a day. */
+  prompted: { start: string; end: string };
+  /** The first-run guide on NOW was closed. */
+  guideDone: boolean;
 }
 
 export const MODES: ModeId[] = ['work', 'free'];
@@ -63,6 +84,9 @@ export const OUTCOME_NAME: Record<Outcome, string> = {
 /** A session this short can be cancelled instead of checked out (started by mistake). */
 export const CANCEL_MS = 2 * 60_000;
 
+/** The focus locks offered when work starts, in minutes. */
+export const LOCKS = [0, 25, 50, 90];
+
 /** How many finished sessions are kept. */
 export const LOG_MAX = 1000;
 
@@ -74,37 +98,69 @@ export function initialState(now: number): State {
     mode: 'free',
     since: now,
     rules: {
-      work: { blocked: ['discord.exe', 'epicgameslauncher.exe', 'steam.exe'], startup: [] },
+      work: { blocked: ['discord.exe', 'epicgameslauncher.exe', 'steam.exe'], sites: [], startup: [] },
       // Empty: Modes starts in free time, and nothing should close without the user choosing it.
-      free: { blocked: [], startup: [] },
+      free: { blocked: [], sites: [], startup: [] },
     },
     current: null,
     log: [],
-    settings: { autostart: true, openStartup: true },
+    settings: { autostart: true, openStartup: true, schedule: { on: false, days: [1, 2, 3, 4, 5], start: 9 * 60, end: 17 * 60 } },
+    prompted: { start: '', end: '' },
+    guideDone: false,
   };
 }
 
-export function startWork(s: State, goal: string, now: number): State {
+/** The local day of `t`, `2026-10-16`. */
+export function dayKey(t: number): string {
+  const d = new Date(t);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+/** `minutes` after local midnight of the day of `t`. */
+export function atMinutes(t: number, minutes: number): number {
+  const d = new Date(t);
+  d.setHours(0, minutes, 0, 0);
+  return d.getTime();
+}
+
+/** Starts work on `goal`, optionally locked for `lockMin` minutes. */
+export function startWork(s: State, goal: string, now: number, lockMin = 0): State {
   const g = goal.trim().slice(0, GOAL_MAX);
   if (!g || s.mode === 'work') return s;
   return {
     ...s,
     mode: 'work',
     since: now,
-    current: { id: `w${now.toString(36)}`, start: now, end: null, goal: g, outcome: null, next: '', usage: {} },
+    current: {
+      id: `w${now.toString(36)}`,
+      start: now,
+      end: null,
+      goal: g,
+      outcome: null,
+      next: '',
+      usage: {},
+      tries: {},
+      lockUntil: lockMin > 0 ? now + lockMin * 60_000 : null,
+    },
+    // Work started today: the schedule does not need to ask any more.
+    prompted: { ...s.prompted, start: dayKey(now) },
   };
 }
 
-/** Leaves work: the session goes to the log with how it went. */
+export function isLocked(s: State, now: number): boolean {
+  return s.mode === 'work' && !!s.current?.lockUntil && now < s.current.lockUntil;
+}
+
+/** Leaves work: the session goes to the log with how it went. Not while it is locked. */
 export function checkOut(s: State, outcome: Outcome, next: string, now: number): State {
-  if (s.mode !== 'work') return s;
+  if (s.mode !== 'work' || isLocked(s, now)) return s;
   const log = s.current
     ? [{ ...s.current, end: Math.max(now, s.current.start), outcome, next: next.trim().slice(0, GOAL_MAX) }, ...s.log].slice(0, LOG_MAX)
     : s.log;
   return { ...s, mode: 'free', since: now, current: null, log };
 }
 
-/** Leaves work without a trace. Only allowed in the first `CANCEL_MS`. */
+/** Leaves work without a trace. Only allowed in the first `CANCEL_MS` (also when locked). */
 export function cancelWork(s: State, now: number): State {
   if (!canCancel(s, now)) return s;
   return { ...s, mode: 'free', since: now, current: null };
@@ -127,6 +183,18 @@ export function addUsage(s: State, delta: Record<string, number>): State {
   return changed ? { ...s, current: { ...s.current, usage } } : s;
 }
 
+/** A blocked program or site was opened during work (and closed again). */
+export function addTry(s: State, name: string): State {
+  if (!s.current || !name) return s;
+  const tries = { ...s.current.tries, [name]: (s.current.tries[name] ?? 0) + 1 };
+  return { ...s, current: { ...s.current, tries } };
+}
+
+export function deleteSession(s: State, id: string): State {
+  const log = s.log.filter((w) => w.id !== id);
+  return log.length === s.log.length ? s : { ...s, log };
+}
+
 /** The "next step" written at the last check-out, offered as the next goal. */
 export function suggestedGoal(s: State): string {
   return s.log.find((w) => w.outcome !== 'skipped')?.next ?? '';
@@ -134,6 +202,27 @@ export function suggestedGoal(s: State): string {
 
 export function setRules(s: State, mode: ModeId, rules: ModeRules): State {
   return { ...s, rules: { ...s.rules, [mode]: rules } };
+}
+
+export type Prompt = 'start' | 'end';
+
+/**
+ * What the schedule asks now, if anything: to start work (free time inside work hours, not asked or
+ * started today) or to check out (work that began before today's end, after it, not asked today).
+ */
+export function schedulePrompt(s: State, now: number): Prompt | null {
+  const sc = s.settings.schedule;
+  if (!sc.on || !sc.days.includes(new Date(now).getDay())) return null;
+  const day = dayKey(now);
+  const start = atMinutes(now, sc.start);
+  const end = atMinutes(now, sc.end);
+  if (s.mode === 'free' && now >= start && now < end && s.prompted.start !== day) return 'start';
+  if (s.mode === 'work' && s.current && now >= end && s.current.start < end && s.prompted.end !== day) return 'end';
+  return null;
+}
+
+export function markPrompted(s: State, p: Prompt, now: number): State {
+  return { ...s, prompted: { ...s.prompted, [p]: dayKey(now) } };
 }
 
 export function activeMs(usage: Record<string, number>): number {

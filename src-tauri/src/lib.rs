@@ -1,9 +1,10 @@
 //! The Windows shell around the web app:
-//!  - closing blocked programs while a mode is on (`rules::Enforcer`, every 2 s),
+//!  - closing blocked programs while a mode is on (`rules::Enforcer`, every 2 s), and browser tabs
+//!    of blocked sites (`rules::SiteGuard`, every second),
 //!  - counting which program is in front during work (`rules::Tally`, every second),
 //!  - opening startup items, listing running programs,
 //!  - a tray icon with the mode and a menu, staying alive in the tray (closing the window only hides
-//!    it) and starting with Windows.
+//!    it), starting with Windows, and Ctrl+Alt+M to start or end work from anywhere.
 //!
 //! The web app owns the state. It calls `set_mode` after every change and takes the counted time
 //! with `take_usage`; Rust tells it about tray clicks (`tray` event) and closed programs (`blocked`).
@@ -11,7 +12,7 @@
 mod rules;
 mod win;
 
-use rules::{Action, Enforcer, Tally, IDLE_MS};
+use rules::{Action, Enforcer, SiteGuard, Tally, IDLE_MS};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -36,8 +37,13 @@ struct Shared {
     mode: Mutex<String>,
     /// The mode's name as the user sees it, for notifications.
     label: Mutex<String>,
+    /// The tray menu's first line, e.g. "WORK: Write the release notes".
+    status: Mutex<String>,
     blocked: Mutex<HashSet<String>>,
     enforcer: Mutex<Enforcer>,
+    /// The words of blocked sites in tab titles (`siteKeys` in src/core/programs.ts).
+    sites: Mutex<HashSet<String>>,
+    guard: Mutex<SiteGuard>,
     tally: Mutex<Tally>,
     /// Program time is counted (only during work).
     tracking: AtomicBool,
@@ -45,12 +51,29 @@ struct Shared {
     notified: Mutex<HashMap<String, f64>>,
 }
 
-/// The web app's mode, after every change: what to block and whether to count program time.
+/// The web app's mode, after every change: what to block, whether to count program time, and what
+/// the tray says.
 #[tauri::command]
-fn set_mode(app: AppHandle, mode: String, label: String, blocked: Vec<String>, tracking: bool, state: State<'_, Shared>) -> Result<(), String> {
+#[allow(clippy::too_many_arguments)]
+fn set_mode(
+    app: AppHandle,
+    mode: String,
+    label: String,
+    status: String,
+    blocked: Vec<String>,
+    sites: Vec<String>,
+    tracking: bool,
+    state: State<'_, Shared>,
+) -> Result<(), String> {
     let set: HashSet<String> = blocked.iter().map(|b| b.to_lowercase()).filter(|b| !rules::protected(b)).collect();
     if let Ok(mut b) = state.blocked.lock() {
         *b = set;
+    }
+    if let Ok(mut s) = state.sites.lock() {
+        *s = sites.iter().map(|k| k.to_lowercase()).filter(|k| !k.is_empty()).collect();
+    }
+    if let Ok(mut s) = state.status.lock() {
+        *s = status.clone();
     }
     state.tracking.store(tracking, Ordering::Relaxed);
     let changed = state.mode.lock().map(|mut m| std::mem::replace(&mut *m, mode.clone()) != mode).unwrap_or(true);
@@ -62,7 +85,19 @@ fn set_mode(app: AppHandle, mode: String, label: String, blocked: Vec<String>, t
             e.clear();
         }
     }
-    update_tray(&app, &mode, &label).map_err(|e| e.to_string())
+    update_tray(&app, &mode, &status).map_err(|e| e.to_string())
+}
+
+/// A notification (the schedule's reminders).
+#[tauri::command]
+fn notify(app: AppHandle, title: String, body: String) {
+    let _ = app.notification().builder().title(&title).body(&body).show();
+}
+
+/// Brings the window forward (the schedule asks something).
+#[tauri::command]
+fn show_window(app: AppHandle) {
+    show_main(&app);
 }
 
 /// Which of these programs are running now (to warn before they are closed).
@@ -140,10 +175,16 @@ fn window_in_front(app: &AppHandle) -> bool {
 
 /// The tray menu: the mode, the switch, open, and (outside work) quit. Quitting would stop the
 /// blocking, so during work the way out is ending work.
-fn tray_menu(app: &AppHandle, mode: &str, label: &str) -> tauri::Result<Menu<tauri::Wry>> {
+fn tray_menu(app: &AppHandle, mode: &str, status: &str) -> tauri::Result<Menu<tauri::Wry>> {
     let work = mode == "work";
-    let status = MenuItem::with_id(app, "status", format!("Mode: {label}"), false, None::<&str>)?;
-    let switch = MenuItem::with_id(app, "switch", if work { "End work…" } else { "Start work…" }, true, None::<&str>)?;
+    let status = MenuItem::with_id(app, "status", menu_text(status), false, None::<&str>)?;
+    let switch = MenuItem::with_id(
+        app,
+        "switch",
+        if work { "End work…\tCtrl+Alt+M" } else { "Start work…\tCtrl+Alt+M" },
+        true,
+        None::<&str>,
+    )?;
     let show = MenuItem::with_id(app, "show", "Open Modes", true, None::<&str>)?;
     let sep = PredefinedMenuItem::separator(app)?;
     if work {
@@ -155,12 +196,30 @@ fn tray_menu(app: &AppHandle, mode: &str, label: &str) -> tauri::Result<Menu<tau
     }
 }
 
-fn update_tray(app: &AppHandle, mode: &str, label: &str) -> tauri::Result<()> {
+/// Menu text: short, and `&` would turn the next letter into a shortcut.
+fn menu_text(s: &str) -> String {
+    let s = s.replace('&', "&&");
+    if s.chars().count() > 60 {
+        format!("{}…", s.chars().take(59).collect::<String>())
+    } else {
+        s
+    }
+}
+
+fn update_tray(app: &AppHandle, mode: &str, status: &str) -> tauri::Result<()> {
     if let Some(tray) = app.tray_by_id(TRAY_ID) {
-        tray.set_menu(Some(tray_menu(app, mode, label)?))?;
-        tray.set_tooltip(Some(format!("Modes · {label}")))?;
+        tray.set_menu(Some(tray_menu(app, mode, status)?))?;
+        // Windows cuts tooltips at 127 characters.
+        let tip: String = format!("Modes · {status}").chars().take(120).collect();
+        tray.set_tooltip(Some(tip))?;
     }
     Ok(())
+}
+
+/// What the tray's switch, the hotkey and the window share: bring the window and let the UI ask.
+fn ask_switch(app: &AppHandle) {
+    show_main(app);
+    let _ = app.emit("tray", "switch");
 }
 
 fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
@@ -177,10 +236,7 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
                 }
             }
             "show" => show_main(app),
-            "switch" => {
-                show_main(app);
-                let _ = app.emit("tray", "switch");
-            }
+            "switch" => ask_switch(app),
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
@@ -200,8 +256,9 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
-/// Reports closed programs: an event for the window and, when it is not in front, a notification.
-fn report(app: &AppHandle, closed: Vec<String>, now: f64) {
+/// Reports closed programs or site tabs: an event for the window and, when it is not in front, a
+/// notification.
+fn report(app: &AppHandle, closed: Vec<String>, now: f64, sites: bool) {
     let state = app.state::<Shared>();
     let label = state.label.lock().map(|l| l.clone()).unwrap_or_default();
     let Ok(mut notified) = state.notified.lock() else { return };
@@ -217,12 +274,12 @@ fn report(app: &AppHandle, closed: Vec<String>, now: f64) {
     drop(notified);
     if !window_in_front(app) {
         let names: Vec<&str> = fresh.iter().map(|a| a.trim_end_matches(".exe")).collect();
-        let _ = app
-            .notification()
-            .builder()
-            .title(format!("Blocked in {label}"))
-            .body(format!("Closing {}.", names.join(", ")))
-            .show();
+        let body = if sites {
+            format!("Closed the {} tab.", names.join(", "))
+        } else {
+            format!("Closing {}.", names.join(", "))
+        };
+        let _ = app.notification().builder().title(format!("Blocked in {label}")).body(body).show();
     }
 }
 
@@ -236,13 +293,34 @@ fn start_thread(app: AppHandle) {
             let state = app.state::<Shared>();
             let now = now_ms();
 
-            let front = if state.tracking.load(Ordering::Relaxed) && win::idle_ms() < IDLE_MS {
-                win::foreground()
+            let tracking = state.tracking.load(Ordering::Relaxed);
+            let sites = state.sites.lock().map(|s| s.clone()).unwrap_or_default();
+            // Titles are read only to find blocked sites, never kept.
+            let window = if tracking || !sites.is_empty() {
+                win::front_window(!sites.is_empty())
+            } else {
+                None
+            };
+
+            let front = if tracking && win::idle_ms() < IDLE_MS {
+                window.as_ref().map(|(_, a, _)| a.as_str())
             } else {
                 None
             };
             if let Ok(mut t) = state.tally.lock() {
-                t.tick(now, front.as_deref());
+                t.tick(now, front);
+            }
+
+            // Not tied to idle time: a video plays without any input.
+            let hit = state
+                .guard
+                .lock()
+                .ok()
+                .and_then(|mut g| g.step(window.as_ref().map(|(h, a, t)| (*h, a.as_str(), t.as_str())), &sites));
+            if let (Some(site), Some((hwnd, _, _))) = (hit, window.as_ref()) {
+                if win::close_tab(*hwnd) {
+                    report(&app, vec![site], now, true);
+                }
             }
 
             if !n.is_multiple_of(2) {
@@ -270,7 +348,7 @@ fn start_thread(app: AppHandle) {
                 }
             }
             if !closed.is_empty() {
-                report(&app, closed, now);
+                report(&app, closed, now, false);
             }
         }
     });
@@ -304,7 +382,9 @@ pub fn run() {
             take_usage,
             open_item,
             set_autostart,
-            started_at_login
+            started_at_login,
+            notify,
+            show_window
         ])
         .setup(|app| {
             setup_tray(app.handle())?;
@@ -313,6 +393,21 @@ pub fn run() {
             // until the user opens it.
             if !started_at_login() {
                 show_main(app.handle());
+            }
+            // Ctrl+Alt+M works from any app. If another program already owns it, it is just not available.
+            {
+                use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+                let hotkey = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyM);
+                app.handle().plugin(
+                    tauri_plugin_global_shortcut::Builder::new()
+                        .with_handler(move |app, shortcut, event| {
+                            if shortcut == &hotkey && event.state() == ShortcutState::Pressed {
+                                ask_switch(app);
+                            }
+                        })
+                        .build(),
+                )?;
+                let _ = app.global_shortcut().register(hotkey);
             }
             Ok(())
         })

@@ -12,10 +12,14 @@ mod imp {
     use windows_sys::Win32::System::Threading::{
         OpenProcess, QueryFullProcessImageNameW, TerminateProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
     };
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        GetAsyncKeyState, GetLastInputInfo, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, LASTINPUTINFO, VIRTUAL_KEY, VK_CONTROL,
+        VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
+    };
     use windows_sys::Win32::UI::Shell::ShellExecuteW;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetForegroundWindow, GetWindowTextLengthW, GetWindowThreadProcessId, IsWindowVisible, PostMessageW, SW_SHOWNORMAL, WM_CLOSE,
+        EnumWindows, GetForegroundWindow, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, PostMessageW, SW_SHOWNORMAL,
+        WM_CLOSE,
     };
 
     fn wide(s: &str) -> Vec<u16> {
@@ -99,8 +103,8 @@ mod imp {
         processes().into_iter().filter(|(pid, _)| pids.contains(pid)).map(|(_, app)| app).collect()
     }
 
-    /// The program that owns the window in front.
-    pub fn foreground() -> Option<String> {
+    /// The window in front: its handle, the program that owns it and (when `with_title`) its title.
+    pub fn front_window(with_title: bool) -> Option<(isize, String, String)> {
         unsafe {
             let hwnd = GetForegroundWindow();
             if hwnd.is_null() {
@@ -122,7 +126,49 @@ mod imp {
             if ok == 0 || len == 0 {
                 return None;
             }
-            Some(app_name(&String::from_utf16_lossy(&buf[..len as usize])))
+            let app = app_name(&String::from_utf16_lossy(&buf[..len as usize]));
+            let mut title = String::new();
+            if with_title {
+                let mut text = [0u16; 512];
+                let n = GetWindowTextW(hwnd, text.as_mut_ptr(), text.len() as i32);
+                if n > 0 {
+                    title = String::from_utf16_lossy(&text[..n as usize]);
+                }
+            }
+            Some((hwnd as isize, app, title))
+        }
+    }
+
+    fn key(vk: VIRTUAL_KEY, up: bool) -> INPUT {
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: vk,
+                    wScan: 0,
+                    dwFlags: if up { KEYEVENTF_KEYUP } else { 0 },
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        }
+    }
+
+    /// Closes the current tab of the browser window `hwnd` with Ctrl+W, only if that window is still in
+    /// front and no modifier key is held (Ctrl+Shift+W would close the whole window).
+    pub fn close_tab(hwnd: isize) -> bool {
+        unsafe {
+            if GetForegroundWindow() as isize != hwnd {
+                return false;
+            }
+            for vk in [VK_SHIFT, VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN] {
+                if GetAsyncKeyState(vk as i32) < 0 {
+                    return false;
+                }
+            }
+            const VK_W: VIRTUAL_KEY = 0x57;
+            let inputs = [key(VK_CONTROL, false), key(VK_W, false), key(VK_W, true), key(VK_CONTROL, true)];
+            SendInput(inputs.len() as u32, inputs.as_ptr(), std::mem::size_of::<INPUT>() as i32) == inputs.len() as u32
         }
     }
 
@@ -170,7 +216,7 @@ mod imp {
 }
 
 #[cfg(windows)]
-pub use imp::{close, foreground, idle_ms, kill, open, processes, windowed};
+pub use imp::{close, close_tab, front_window, idle_ms, kill, open, processes, windowed};
 
 #[cfg(not(windows))]
 pub fn processes() -> Vec<(u32, String)> {
@@ -189,8 +235,13 @@ pub fn windowed() -> Vec<String> {
 }
 
 #[cfg(not(windows))]
-pub fn foreground() -> Option<String> {
+pub fn front_window(_with_title: bool) -> Option<(isize, String, String)> {
     None
+}
+
+#[cfg(not(windows))]
+pub fn close_tab(_hwnd: isize) -> bool {
+    false
 }
 
 #[cfg(not(windows))]

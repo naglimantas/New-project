@@ -61,3 +61,42 @@ export function addBlocked(list: string[], input: string): AddResult {
 export function shortName(exe: string): string {
   return exe.replace(/\.exe$/, '');
 }
+
+// ───────── Sites ─────────
+// A blocked site is matched against browser tab titles (see `site_in_title` in src-tauri/src/rules.rs):
+// a title like "Some video - YouTube - Google Chrome" has the part "YouTube".
+
+/** What the user typed as a site: `https://www.YouTube.com/watch?v=1` is `youtube.com`; '' if it is not one. */
+export function normalizeSite(input: string): string {
+  let s = input.trim().toLowerCase();
+  s = s.replace(/^[a-z][a-z0-9+.-]*:\/\//, '');
+  s = s.split(/[/?#]/)[0] ?? '';
+  s = s.replace(/:\d+$/, '').replace(/^www\./, '').replace(/\.$/, '');
+  if (!s || !/^[a-z0-9.-]+$/.test(s) || !/[a-z]/.test(s) || s.startsWith('.') || s.includes('..')) return '';
+  return s;
+}
+
+const SECOND_LEVEL = ['co', 'com', 'org', 'net', 'ac', 'gov', 'edu'];
+
+/**
+ * The words a tab title shows for a site, lower case: `youtube.com` → `youtube.com` and `youtube`;
+ * `bbc.co.uk` → also `bbc`; a plain `reddit` → `reddit`. A subdomain such as `music.youtube.com` is only
+ * itself, so it never blocks all of YouTube. Mirrors nothing in Rust: Rust gets these keys.
+ */
+export function siteKeys(site: string): string[] {
+  const labels = site.split('.');
+  const n = labels.length;
+  const ccSecond = n === 3 && SECOND_LEVEL.includes(labels[1]) && labels[2].length === 2;
+  if (n === 1) return [site];
+  if (n === 2) return [site, labels[0]];
+  if (ccSecond) return [site, labels[0]];
+  return [site];
+}
+
+/** Adds a site to a blocklist, or says why it cannot be added. */
+export function addSite(list: string[], input: string): AddResult {
+  const site = normalizeSite(input);
+  if (!site) return { ok: false, reason: 'Not a site. Type it like youtube.com.' };
+  if (list.includes(site)) return { ok: false, reason: `${site} is already on the list.` };
+  return { ok: true, list: [...list, site].sort() };
+}

@@ -135,6 +135,88 @@ impl Tally {
     }
 }
 
+/// Browsers whose tab titles are checked for blocked sites.
+pub const BROWSERS: &[&str] = &[
+    "chrome.exe",
+    "msedge.exe",
+    "firefox.exe",
+    "brave.exe",
+    "opera.exe",
+    "opera_gx.exe",
+    "vivaldi.exe",
+    "arc.exe",
+    "chromium.exe",
+    "librewolf.exe",
+    "waterfox.exe",
+    "zen.exe",
+    "floorp.exe",
+];
+
+pub fn is_browser(app: &str) -> bool {
+    BROWSERS.contains(&app)
+}
+
+/// The blocked site a browser window title shows, if any: the title is split into its parts
+/// ("Some video - YouTube - Google Chrome" has "youtube"), and a part that is one of `keys`
+/// (lower case, from `siteKeys` in src/core/programs.ts) matches. A notification count like "(3)"
+/// and Edge's "and 2 more pages" are ignored.
+pub fn site_in_title(title: &str, keys: &HashSet<String>) -> Option<String> {
+    if keys.is_empty() {
+        return None;
+    }
+    let lower = title.to_lowercase();
+    let mut parts = vec![lower.as_str()];
+    for sep in [" - ", " \u{2013} ", " \u{2014} ", " | ", " / ", " \u{b7} ", " : "] {
+        parts = parts.into_iter().flat_map(|p| p.split(sep)).collect();
+    }
+    parts.into_iter().find_map(|p| {
+        let mut p = p.trim();
+        // "(3) YouTube"
+        if p.starts_with('(') {
+            if let Some(i) = p.find(") ") {
+                if p[1..i].chars().all(|c| c.is_ascii_digit() || c == '+') {
+                    p = p[i + 2..].trim();
+                }
+            }
+        }
+        // Edge: "YouTube and 2 more pages"
+        if let Some(i) = p.find(" and ") {
+            if p.ends_with(" more pages") || p.ends_with(" more page") {
+                p = p[..i].trim();
+            }
+        }
+        keys.contains(p).then(|| p.to_string())
+    })
+}
+
+/// Closes browser tabs of blocked sites: only after the same window showed one for two ticks in a
+/// row, so a title flashing by while switching tabs closes nothing.
+#[derive(Default)]
+pub struct SiteGuard {
+    seen: Option<(isize, String)>,
+}
+
+impl SiteGuard {
+    /// One look at the window in front (`hwnd`, program, title). Returns the site to close the tab of.
+    pub fn step(&mut self, front: Option<(isize, &str, &str)>, keys: &HashSet<String>) -> Option<String> {
+        let hit = front.and_then(|(hwnd, app, title)| {
+            if is_browser(app) {
+                site_in_title(title, keys).map(|s| (hwnd, s))
+            } else {
+                None
+            }
+        });
+        match (hit, self.seen.take()) {
+            (Some(h), Some(prev)) if h == prev => Some(h.1),
+            (Some(h), _) => {
+                self.seen = Some(h);
+                None
+            }
+            (None, _) => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,6 +283,49 @@ mod tests {
         assert_eq!(got["code.exe"], 2_000.0);
         assert_eq!(got["chrome.exe"], 1_000.0);
         assert!(t.take().is_empty());
+    }
+
+    fn keys(k: &[&str]) -> HashSet<String> {
+        k.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn finds_blocked_sites_in_tab_titles() {
+        let k = keys(&["youtube.com", "youtube", "reddit", "x"]);
+        assert_eq!(site_in_title("Rust in 100 seconds - YouTube - Google Chrome", &k), Some("youtube".into()));
+        assert_eq!(site_in_title("(3) YouTube - Mozilla Firefox", &k), Some("youtube".into()));
+        assert_eq!(site_in_title("Home / X \u{2014} Mozilla Firefox", &k), Some("x".into()));
+        assert_eq!(
+            site_in_title("Rust in 100 seconds - YouTube and 2 more pages - Personal - Microsoft\u{200b} Edge", &k),
+            Some("youtube".into())
+        );
+        assert_eq!(site_in_title("r/rust : Reddit", &k), Some("reddit".into()));
+        // A page about YouTube, YouTube Music, an empty list: not blocked.
+        assert_eq!(site_in_title("How YouTube works - Wikipedia - Google Chrome", &keys(&["reddit"])), None);
+        assert_eq!(site_in_title("YouTube Music - Google Chrome", &k), None);
+        assert_eq!(site_in_title("Notes about youtube.com - Google Docs - Google Chrome", &k), None);
+        assert_eq!(site_in_title("youtube.com/watch?v=1 - Google Chrome", &k), None);
+        assert_eq!(site_in_title("youtube.com - Google Chrome", &k), Some("youtube.com".into()));
+        assert_eq!(site_in_title("YouTube - Google Chrome", &HashSet::new()), None);
+    }
+
+    #[test]
+    fn closes_a_tab_only_after_two_looks_at_the_same_window() {
+        let k = keys(&["youtube"]);
+        let mut g = SiteGuard::default();
+        let yt = Some((7isize, "chrome.exe", "Video - YouTube - Google Chrome"));
+        assert_eq!(g.step(yt, &k), None);
+        assert_eq!(g.step(yt, &k), Some("youtube".into()));
+        // Right after closing it starts over.
+        assert_eq!(g.step(yt, &k), None);
+        assert_eq!(g.step(Some((7, "chrome.exe", "Docs - Google Chrome")), &k), None);
+        assert_eq!(g.step(yt, &k), None);
+        // Another window, or not a browser.
+        assert_eq!(g.step(Some((8, "chrome.exe", "Video - YouTube - Google Chrome")), &k), None);
+        let mut g = SiteGuard::default();
+        let editor = Some((9isize, "code.exe", "notes - YouTube - Visual Studio Code"));
+        assert_eq!(g.step(editor, &k), None);
+        assert_eq!(g.step(editor, &k), None);
     }
 
     #[test]

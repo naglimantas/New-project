@@ -1,8 +1,25 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { addUsage, cancelWork, canCancel, checkOut, MODE_NAME, setRules, startWork, suggestedGoal, type ModeId, type Outcome, type State } from '../core/model';
-import { shortName } from '../core/programs';
+import {
+  addTry,
+  addUsage,
+  cancelWork,
+  canCancel,
+  checkOut,
+  deleteSession,
+  isLocked,
+  markPrompted,
+  MODE_NAME,
+  schedulePrompt,
+  setRules,
+  startWork,
+  suggestedGoal,
+  type ModeId,
+  type Outcome,
+  type State,
+} from '../core/model';
+import { shortName, siteKeys } from '../core/programs';
 import { loadState, saveState } from '../core/store';
-import { onNative, openItem, setAutostart, setMode, startedAtLogin, takeUsage } from '../platform/native';
+import { notify, onNative, openItem, setAutostart, setMode, showWindow, startedAtLogin, takeUsage } from '../platform/native';
 import { CheckOutDialog, StartWorkDialog } from './dialogs';
 import { toast, Toasts } from './kit';
 import { LogScreen, NowScreen, RulesScreen } from './screens';
@@ -25,6 +42,11 @@ function openStartup(s: State, mode: ModeId) {
   }
 }
 
+/** The tray's first line: the mode, and during work the goal. */
+function trayStatus(s: State): string {
+  return s.mode === 'work' && s.current ? `WORK: ${s.current.goal}` : MODE_NAME[s.mode];
+}
+
 export function App() {
   const [s, setS] = useState<State>(() => loadState(Date.now()));
   const [tab, setTab] = useState<Tab>('now');
@@ -32,15 +54,22 @@ export function App() {
   const now = useNow(1000);
   const latest = useRef(s);
   latest.current = s;
+  const dialogRef = useRef(dialog);
+  dialogRef.current = dialog;
 
   // Every change is saved at once, so a crash or shutdown loses nothing.
   useEffect(() => saveState(s), [s]);
 
   // Windows follows the mode: what to block, whether to count program time, what the tray says.
-  const blockedKey = s.rules[s.mode].blocked.join('|');
+  const rules = s.rules[s.mode];
+  const blockedKey = rules.blocked.join('|');
+  const sitesKey = rules.sites.join('|');
+  const status = trayStatus(s);
   useEffect(() => {
-    setMode(s.mode, MODE_NAME[s.mode], blockedKey ? blockedKey.split('|') : [], s.mode === 'work').catch((e) => toast(`Windows side: ${String(e)}`, 'warn'));
-  }, [s.mode, blockedKey]);
+    const blocked = blockedKey ? blockedKey.split('|') : [];
+    const sites = sitesKey ? sitesKey.split('|').flatMap(siteKeys) : [];
+    setMode(s.mode, MODE_NAME[s.mode], status, blocked, sites, s.mode === 'work').catch((e) => toast(`Windows side: ${String(e)}`, 'warn'));
+  }, [s.mode, blockedKey, sitesKey, status]);
 
   useEffect(() => {
     setAutostart(s.settings.autostart).catch(() => {});
@@ -82,11 +111,12 @@ export function App() {
     return () => window.removeEventListener('beforeunload', save);
   }, []);
 
-  const doStart = (goal: string) => {
-    const next = startWork(latest.current, goal, Date.now());
+  const doStart = (goal: string, lockMin: number) => {
+    const next = startWork(latest.current, goal, Date.now(), lockMin);
     if (next === latest.current) return;
     // Time measured before work started is not part of it.
     void takeUsage().catch(() => {});
+    latest.current = next;
     setS(next);
     setDialog(null);
     openStartup(next, 'work');
@@ -105,9 +135,13 @@ export function App() {
     }
     checkingOut.current = false;
     const before = latest.current;
-    setDialog(null);
-    if (before.mode !== 'work') return;
     const after = checkOut(addUsage(before, delta), outcome, next, Date.now());
+    if (after.mode !== 'free') {
+      // Still locked (or not in work): keep the measured time, end nothing.
+      if (before.mode === 'work') setS((x) => addUsage(x, delta));
+      return;
+    }
+    setDialog(null);
     latest.current = after;
     setS(after);
     toast(outcome === 'skipped' ? 'Work ended without a check-out.' : `Work ended: ${outcome === 'done' ? 'done.' : outcome === 'partly' ? 'partly done.' : 'not done.'}`);
@@ -130,20 +164,39 @@ export function App() {
     }
   }, [flushUsage]);
 
-  // The tray's "Start work…" / "End work…", and programs Windows closed.
+  // The tray's "Start work…" / "End work…" and Ctrl+Alt+M, and what Windows closed.
   useEffect(() => {
     const a = onNative('tray', (p) => {
-      if (p === 'switch') {
+      if (p === 'switch' && !dialogRef.current) {
         setTab('now');
         onSwitch();
       }
     });
-    const b = onNative('blocked', (app) => toast(`${shortName(app)} is blocked in ${MODE_NAME[latest.current.mode]}: closing it.`, 'warn'));
+    const b = onNative('blocked', (name) => {
+      const site = !name.endsWith('.exe');
+      toast(site ? `${name} is blocked in ${MODE_NAME[latest.current.mode]}: tab closed.` : `${shortName(name)} is blocked in ${MODE_NAME[latest.current.mode]}: closing it.`, 'warn');
+      setS((x) => addTry(x, name));
+    });
     return () => {
       a();
       b();
     };
   }, [onSwitch]);
+
+  // Work hours: ask to start, and to check out at the end (not while a dialog is open or work is locked).
+  useEffect(() => {
+    const x = latest.current;
+    const p = schedulePrompt(x, now);
+    if (!p || dialogRef.current || (p === 'end' && isLocked(x, now))) return;
+    setS((y) => markPrompted(y, p, now));
+    setTab('now');
+    setDialog(p === 'start' ? 'start' : 'checkout');
+    void showWindow().catch(() => {});
+    void notify(p === 'start' ? 'Time to start work' : 'Work hours are over', p === 'start' ? 'What will you get done?' : 'How did it go? Check out to end work.').catch(
+      () => {},
+    );
+    if (p === 'end') void flushUsage();
+  }, [now, flushUsage]);
 
   // Keys: 1–3 switch screens, Esc closes a dialog.
   useEffect(() => {
@@ -179,13 +232,21 @@ export function App() {
         <span className={`mode-tag ${s.mode}`}>{MODE_NAME[s.mode]}</span>
       </nav>
       <main>
-        {tab === 'now' && <NowScreen s={s} now={now} onSwitch={onSwitch} />}
+        {tab === 'now' && <NowScreen s={s} now={now} onSwitch={onSwitch} onGuideDone={() => setS((x) => ({ ...x, guideDone: true }))} />}
         {tab === 'rules' && <RulesScreen s={s} onRules={(m, r) => setS((x) => setRules(x, m, r))} onSettings={(st) => setS((x) => ({ ...x, settings: st }))} />}
-        {tab === 'log' && <LogScreen s={s} now={now} />}
+        {tab === 'log' && <LogScreen s={s} now={now} onDelete={(id) => setS((x) => deleteSession(x, id))} />}
       </main>
       {dialog === 'start' && s.mode === 'free' && <StartWorkDialog s={s} suggestion={suggestedGoal(s)} onStart={doStart} onClose={() => setDialog(null)} />}
       {dialog === 'checkout' && s.mode === 'work' && (
-        <CheckOutDialog s={s} now={now} canCancel={canCancel(s, now)} onDone={(o, n) => void doCheckOut(o, n)} onCancelWork={doCancel} onClose={() => setDialog(null)} />
+        <CheckOutDialog
+          s={s}
+          now={now}
+          canCancel={canCancel(s, now)}
+          locked={isLocked(s, now)}
+          onDone={(o, n) => void doCheckOut(o, n)}
+          onCancelWork={doCancel}
+          onClose={() => setDialog(null)}
+        />
       )}
       <Toasts />
     </div>

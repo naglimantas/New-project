@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { addUsage, cancelWork, canCancel, checkOut, initialState, setRules, startWork, suggestedGoal, topApps, CANCEL_MS } from './model';
-import { addBlocked, normalizeExe } from './programs';
+import { addTry, addUsage, atMinutes, cancelWork, canCancel, checkOut, dayKey, deleteSession, initialState, isLocked, markPrompted, schedulePrompt, setRules, startWork, suggestedGoal, topApps, CANCEL_MS, type State } from './model';
+import { addBlocked, addSite, normalizeExe, normalizeSite, siteKeys } from './programs';
 import { parseState } from './store';
-import { fmtClock, fmtDuration, weekStart, weekSummary } from './stats';
+import { fmtClock, fmtDuration, lastDays, weekStart, weekSummary } from './stats';
 
 const T0 = new Date(2026, 9, 14, 9, 0).getTime(); // Wednesday 14 Oct 2026, 09:00 local
 const MIN = 60_000;
@@ -95,7 +95,8 @@ describe('saved state', () => {
   it('round-trips', () => {
     let s = startWork(initialState(T0), 'A', T0);
     s = addUsage(s, { 'code.exe': MIN });
-    s = setRules(s, 'free', { blocked: ['slack.exe'], startup: [{ target: 'https://example.com', args: '' }] });
+    s = setRules(s, 'free', { blocked: ['slack.exe'], sites: ['youtube.com'], startup: [{ target: 'https://example.com', args: '' }] });
+    s = addTry(startWork(s, 'B', T0), 'steam.exe');
     expect(parseState(JSON.stringify(s), T0 + 5)).toEqual(s);
   });
 
@@ -115,7 +116,7 @@ describe('saved state', () => {
     );
     // Work without a session is free time.
     expect(odd.mode).toBe('free');
-    expect(odd.rules.work).toEqual({ blocked: ['steam.exe'], startup: [{ target: 'x.exe', args: '' }] });
+    expect(odd.rules.work).toEqual({ blocked: ['steam.exe'], sites: [], startup: [{ target: 'x.exe', args: '' }] });
     expect(odd.rules.free).toEqual(initialState(T0).rules.free);
     // The unfinished session in the log is dropped.
     expect(odd.log).toHaveLength(1);
@@ -152,5 +153,105 @@ describe('week summary', () => {
     expect(fmtDuration(12 * MIN + 5000)).toBe('12m');
     expect(fmtDuration(40_000)).toBe('40s');
     expect(fmtClock(3_909_000)).toBe('1:05:09');
+  });
+});
+
+describe('focus lock and tries', () => {
+  it('cannot check out while locked, but can cancel a mistaken start', () => {
+    const s = startWork(initialState(T0), 'Deep work', T0, 50);
+    expect(s.current?.lockUntil).toBe(T0 + 50 * MIN);
+    expect(isLocked(s, T0 + 49 * MIN)).toBe(true);
+    expect(checkOut(s, 'done', '', T0 + 49 * MIN)).toBe(s);
+    expect(cancelWork(s, T0 + MIN).mode).toBe('free');
+    expect(isLocked(s, T0 + 50 * MIN)).toBe(false);
+    expect(checkOut(s, 'done', '', T0 + 50 * MIN).log[0].lockUntil).toBe(T0 + 50 * MIN);
+    expect(startWork(initialState(T0), 'x', T0).current?.lockUntil).toBeNull();
+  });
+
+  it('counts tries during work only, and deletes log entries', () => {
+    expect(addTry(initialState(T0), 'steam.exe').current).toBeNull();
+    let s = startWork(initialState(T0), 'A', T0);
+    s = addTry(addTry(addTry(s, 'steam.exe'), 'steam.exe'), 'youtube.com');
+    expect(s.current?.tries).toEqual({ 'steam.exe': 2, 'youtube.com': 1 });
+    s = checkOut(s, 'done', '', T0 + MIN);
+    const id = s.log[0].id;
+    expect(deleteSession(s, 'nope')).toBe(s);
+    expect(deleteSession(s, id).log).toHaveLength(0);
+  });
+});
+
+describe('schedule', () => {
+  // T0 is Wednesday 09:00.
+  const on = (s: State): State => ({ ...s, settings: { ...s.settings, schedule: { on: true, days: [1, 2, 3, 4, 5], start: 9 * 60, end: 17 * 60 } } });
+
+  it('asks to start once a day inside work hours on work days', () => {
+    const s = on(initialState(T0));
+    expect(schedulePrompt(initialState(T0), T0)).toBeNull(); // off by default
+    expect(schedulePrompt(s, T0 - MIN)).toBeNull();
+    expect(schedulePrompt(s, T0)).toBe('start');
+    expect(schedulePrompt(s, T0 + 3 * 60 * MIN)).toBe('start'); // the PC was off at 09:00
+    expect(schedulePrompt(markPrompted(s, 'start', T0), T0 + MIN)).toBeNull();
+    expect(schedulePrompt(markPrompted(s, 'start', T0), T0 + 24 * 60 * MIN)).toBe('start'); // Thursday
+    expect(schedulePrompt(s, T0 + 8 * 60 * MIN)).toBeNull(); // 17:00, after hours
+    expect(schedulePrompt(s, T0 + 3 * 24 * 60 * MIN)).toBeNull(); // Saturday
+  });
+
+  it('does not ask to start after work was already started and ended today', () => {
+    let s = on(initialState(T0));
+    s = startWork(s, 'A', T0 - 30 * MIN);
+    s = checkOut(s, 'done', '', T0 + 60 * MIN);
+    expect(schedulePrompt(s, T0 + 61 * MIN)).toBeNull();
+  });
+
+  it('asks to check out at the end, only for work begun before it', () => {
+    const s = startWork(on(initialState(T0)), 'A', T0);
+    const end = atMinutes(T0, 17 * 60);
+    expect(schedulePrompt(s, end - 1)).toBeNull();
+    expect(schedulePrompt(s, end)).toBe('end');
+    expect(schedulePrompt(markPrompted(s, 'end', end), end + MIN)).toBeNull();
+    const late = startWork(on(initialState(T0)), 'Evening', end + 60 * MIN);
+    expect(schedulePrompt(late, end + 61 * MIN)).toBeNull();
+    expect(dayKey(T0)).toBe('2026-10-14');
+  });
+});
+
+describe('sites', () => {
+  it('normalizes what the user types', () => {
+    expect(normalizeSite('https://www.YouTube.com/watch?v=1')).toBe('youtube.com');
+    expect(normalizeSite(' reddit.com/r/rust ')).toBe('reddit.com');
+    expect(normalizeSite('localhost:3000')).toBe('localhost');
+    expect(normalizeSite('Reddit')).toBe('reddit');
+    expect(normalizeSite('not a site')).toBe('');
+    expect(normalizeSite('123')).toBe('');
+    expect(addSite(['youtube.com'], 'www.youtube.com')).toMatchObject({ ok: false });
+    expect(addSite(['youtube.com'], 'x.com')).toEqual({ ok: true, list: ['x.com', 'youtube.com'] });
+  });
+
+  it('knows the word a tab title shows', () => {
+    expect(siteKeys('youtube.com')).toEqual(['youtube.com', 'youtube']);
+    expect(siteKeys('bbc.co.uk')).toEqual(['bbc.co.uk', 'bbc']);
+    expect(siteKeys('music.youtube.com')).toEqual(['music.youtube.com']);
+    expect(siteKeys('reddit')).toEqual(['reddit']);
+  });
+});
+
+describe('last days', () => {
+  it('sums work per day, oldest first, today included', () => {
+    let s = initialState(T0);
+    for (const [start, mins, o] of [
+      [T0 - 24 * 60 * MIN, 60, 'done'],
+      [T0, 30, 'partly'],
+      [T0 + 60 * MIN, 45, 'done'],
+      [T0 - 9 * 24 * 60 * MIN, 50, 'done'],
+    ] as const) {
+      s = startWork(s, 'x', start);
+      s = checkOut(s, o, '', start + mins * MIN);
+    }
+    const days = lastDays(s.log, T0 + 2 * 60 * MIN);
+    expect(days).toHaveLength(7);
+    expect(days[6].day).toBe(new Date(2026, 9, 14).getTime());
+    expect(days[6]).toMatchObject({ ms: 75 * MIN, sessions: 2, done: 1 });
+    expect(days[5]).toMatchObject({ ms: 60 * MIN, sessions: 1, done: 1 });
+    expect(days.slice(0, 5).every((d) => d.ms === 0)).toBe(true);
   });
 });
