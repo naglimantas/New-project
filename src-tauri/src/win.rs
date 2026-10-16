@@ -6,7 +6,7 @@
 mod imp {
     use crate::rules::app_name;
     use std::collections::HashSet;
-    use windows_sys::Win32::Foundation::{CloseHandle, BOOL, HWND, INVALID_HANDLE_VALUE, LPARAM};
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, BOOL, HWND, INVALID_HANDLE_VALUE, LPARAM};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS};
     use windows_sys::Win32::System::SystemInformation::GetTickCount;
     use windows_sys::Win32::System::Threading::{
@@ -16,7 +16,7 @@ mod imp {
         GetAsyncKeyState, GetLastInputInfo, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, LASTINPUTINFO, VIRTUAL_KEY, VK_CONTROL,
         VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
     };
-    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         EnumWindows, GetForegroundWindow, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, PostMessageW, SW_SHOWNORMAL,
         WM_CLOSE,
@@ -186,31 +186,133 @@ mod imp {
         }
     }
 
-    /// Opens a program, shortcut, file, folder or URL the way a double-click would.
+    /// Opens a program, shortcut, file, folder or URL the way a double-click would. Errors come back
+    /// as text; Windows shows no error box of its own (`SEE_MASK_FLAG_NO_UI`).
     pub fn open(target: &str, args: &str) -> Result<(), String> {
         let verb = wide("open");
         let file = wide(target);
         let params = wide(args);
-        let r = unsafe {
-            ShellExecuteW(
-                std::ptr::null_mut(),
-                verb.as_ptr(),
-                file.as_ptr(),
-                if args.is_empty() { std::ptr::null() } else { params.as_ptr() },
-                std::ptr::null(),
-                SW_SHOWNORMAL,
-            )
+        let ok = unsafe {
+            let mut info: SHELLEXECUTEINFOW = std::mem::zeroed();
+            info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+            info.fMask = SEE_MASK_FLAG_NO_UI | SEE_MASK_NOASYNC;
+            info.lpVerb = verb.as_ptr();
+            info.lpFile = file.as_ptr();
+            info.lpParameters = if args.is_empty() { std::ptr::null() } else { params.as_ptr() };
+            info.nShow = SW_SHOWNORMAL;
+            ShellExecuteExW(&mut info)
         };
-        // Values up to 32 are error codes.
-        if r as isize > 32 {
-            Ok(())
-        } else {
-            Err(match r as isize {
-                2 | 3 => "not found".into(),
-                5 => "access denied".into(),
-                31 => "no program is set to open it".into(),
-                n => format!("Windows error {n}"),
-            })
+        if ok != 0 {
+            return Ok(());
+        }
+        Err(match unsafe { GetLastError() } {
+            2 | 3 => "not found".into(),
+            5 => "access denied".into(),
+            1155 => "no program is set to open it".into(),
+            1223 => "cancelled".into(),
+            n => format!("Windows error {n}"),
+        })
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    //! These run on a real Windows (the CI's windows job): they start throwaway processes and check
+    //! that Modes sees, closes and ends them.
+    use super::*;
+    use crate::rules::{Action, Enforcer, GRACE_MS};
+    use std::collections::HashSet;
+    use std::process::{Child, Command};
+    use std::time::{Duration, Instant};
+
+    fn wait_for(secs: u64, mut f: impl FnMut() -> bool) -> bool {
+        let until = Instant::now() + Duration::from_secs(secs);
+        while Instant::now() < until {
+            if f() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        f()
+    }
+
+    fn exited(child: &mut Child, secs: u64) -> bool {
+        wait_for(secs, || matches!(child.try_wait(), Ok(Some(_))))
+    }
+
+    /// A process without a window that runs for a minute.
+    fn pinger() -> Child {
+        Command::new("ping").args(["-n", "60", "127.0.0.1"]).spawn().expect("ping starts")
+    }
+
+    #[test]
+    fn sees_and_ends_a_running_process() {
+        let mut child = pinger();
+        let pid = child.id();
+        assert!(
+            wait_for(5, || processes().contains(&(pid, "ping.exe".to_string()))),
+            "ping.exe in the process list"
+        );
+        kill(pid);
+        assert!(exited(&mut child, 5), "ping.exe ended");
+        assert!(!processes().iter().any(|(p, _)| *p == pid));
+    }
+
+    #[test]
+    fn the_enforcer_ends_a_blocked_program_after_the_grace_time() {
+        let mut child = pinger();
+        let pid = child.id();
+        assert!(wait_for(5, || processes().iter().any(|(p, _)| *p == pid)));
+        let blocked: HashSet<String> = ["ping.exe".to_string()].into();
+        let mut e = Enforcer::default();
+        let own = std::process::id();
+        let first = e.step(0.0, &processes(), &blocked, own);
+        assert!(first.contains(&Action::Close(pid, "ping.exe".into())), "{first:?}");
+        for a in &first {
+            if let Action::Close(p, _) = a {
+                close(*p);
+            }
+        }
+        // A console program has no window to close: it is still there, and is ended after the grace time.
+        let later = e.step(GRACE_MS, &processes(), &blocked, own);
+        assert!(later.contains(&Action::Kill(pid, "ping.exe".into())), "{later:?}");
+        for a in later {
+            if let Action::Kill(p, _) = a {
+                kill(p);
+            }
+        }
+        assert!(exited(&mut child, 5), "ping.exe ended by the enforcer");
+    }
+
+    #[test]
+    fn closes_a_program_window_like_its_x_button() {
+        let mut child = Command::new("notepad.exe").spawn().expect("notepad starts");
+        let pid = child.id();
+        // The runner may have no desktop to show windows on; then there is nothing to close.
+        if !wait_for(15, || windowed().contains(&"notepad.exe".to_string())) {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("no notepad window appeared (no interactive desktop?): window closing not checked");
+            return;
+        }
+        close(pid);
+        assert!(exited(&mut child, 10), "notepad closed on WM_CLOSE");
+    }
+
+    #[test]
+    fn opens_programs_and_reports_missing_ones() {
+        assert_eq!(open(r"C:\definitely\missing\nothing-here.exe", ""), Err("not found".to_string()));
+        // cmd.exe exits at once; it only has to start.
+        assert_eq!(open("cmd.exe", "/c exit 0"), Ok(()));
+    }
+
+    #[test]
+    fn idle_time_and_the_window_in_front_can_be_read() {
+        // Values depend on the machine; these only must not fail or crash.
+        let _ = idle_ms();
+        if let Some((hwnd, app, _)) = front_window(true) {
+            assert!(hwnd != 0);
+            assert!(!app.is_empty());
         }
     }
 }
