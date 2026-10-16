@@ -1,0 +1,45 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Modes",
+  "mainBinaryName": "modes",
+  "version": "../package.json",
+  "identifier": "com.naglimantas.modes",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:5173",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Modes",
+        "width": 920,
+        "height": 680,
+        "minWidth": 420,
+        "minHeight": 520,
+        "center": true,
+        "visible": false,
+        "backgroundColor": "#171716"
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "publisher": "naglimantas",
+    "category": "Productivity",
+    "shortDescription": "Work and free time modes",
+    "longDescription": "Switch between work and free time: each mode blocks its own programs and opens its own, and work ends with a short check-out of what got done.",
+    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico"],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    }
+  }
+}

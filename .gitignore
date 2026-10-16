@@ -1,0 +1,28 @@
+# Dependencies and build output
+node_modules/
+dist/
+*.tsbuildinfo
+coverage/
+
+# Tauri / Rust build output (see also src-tauri/.gitignore)
+src-tauri/target/
+
+# Signing material must never be committed.
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.pem
+*.key
+*.pass
+.env
+.env.*
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.log
+.vscode/*
+!.vscode/extensions.json
+
+# NOTE: CLAUDE.md and .claude/ are intentionally tracked (context is synced across PCs).
