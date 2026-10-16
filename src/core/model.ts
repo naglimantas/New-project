@@ -34,6 +34,15 @@ export interface WorkSession {
   tries: Record<string, number>;
   /** Work cannot be ended before this (a lock chosen at the start); null without one. */
   lockUntil: number | null;
+  /** Finished breaks: nothing was blocked or measured during them. */
+  breaks: Break[];
+  /** The break going on now (`until` is when it ends by itself); null outside one. */
+  onBreak: { from: number; until: number } | null;
+}
+
+export interface Break {
+  from: number;
+  to: number;
 }
 
 /** Work hours: Modes asks to start work at `start` and to check out at `end` on these days. */
@@ -86,6 +95,9 @@ export const CANCEL_MS = 2 * 60_000;
 
 /** The focus locks offered when work starts, in minutes. */
 export const LOCKS = [0, 25, 50, 90];
+
+/** The breaks offered during work, in minutes. */
+export const BREAKS = [5, 10, 15];
 
 /** How many finished sessions are kept. */
 export const LOG_MAX = 1000;
@@ -141,6 +153,8 @@ export function startWork(s: State, goal: string, now: number, lockMin = 0): Sta
       usage: {},
       tries: {},
       lockUntil: lockMin > 0 ? now + lockMin * 60_000 : null,
+      breaks: [],
+      onBreak: null,
     },
     // Work started today: the schedule does not need to ask any more.
     prompted: { ...s.prompted, start: dayKey(now) },
@@ -154,10 +168,46 @@ export function isLocked(s: State, now: number): boolean {
 /** Leaves work: the session goes to the log with how it went. Not while it is locked. */
 export function checkOut(s: State, outcome: Outcome, next: string, now: number): State {
   if (s.mode !== 'work' || isLocked(s, now)) return s;
-  const log = s.current
-    ? [{ ...s.current, end: Math.max(now, s.current.start), outcome, next: next.trim().slice(0, GOAL_MAX) }, ...s.log].slice(0, LOG_MAX)
-    : s.log;
+  const w = s.current && endBreak(s, Math.min(now, s.current.onBreak?.until ?? now)).current;
+  const log = w ? [{ ...w, end: Math.max(now, w.start), outcome, next: next.trim().slice(0, GOAL_MAX) }, ...s.log].slice(0, LOG_MAX) : s.log;
   return { ...s, mode: 'free', since: now, current: null, log };
+}
+
+/** A break of `min` minutes during work: nothing is blocked or measured until it ends. */
+export function startBreak(s: State, min: number, now: number): State {
+  if (!s.current || s.current.onBreak || min <= 0) return s;
+  return { ...s, current: { ...s.current, onBreak: { from: now, until: now + min * 60_000 } } };
+}
+
+/** Ends the break now (or at `now`, however it ended). */
+export function endBreak(s: State, now: number): State {
+  const b = s.current?.onBreak;
+  if (!s.current || !b) return s;
+  const to = Math.max(b.from, Math.min(now, b.until));
+  const breaks = to > b.from ? [...s.current.breaks, { from: b.from, to }] : s.current.breaks;
+  return { ...s, current: { ...s.current, breaks, onBreak: null } };
+}
+
+export function isOnBreak(s: State, now: number): boolean {
+  return !!s.current?.onBreak && now < s.current.onBreak.until;
+}
+
+/** A break whose time is up, ended at its planned end; otherwise the state as it is. */
+export function settleBreak(s: State, now: number): State {
+  const b = s.current?.onBreak;
+  return b && now >= b.until ? endBreak(s, b.until) : s;
+}
+
+/** Break time of a session, the running break up to `now` included. */
+export function breakMs(w: WorkSession, now = Infinity): number {
+  const done = w.breaks.reduce((a, b) => a + (b.to - b.from), 0);
+  const b = w.onBreak;
+  return done + (b ? Math.max(0, Math.min(now, b.until) - b.from) : 0);
+}
+
+/** Time from start to end (or `now`) without breaks. */
+export function workedMs(w: WorkSession, now: number): number {
+  return Math.max(0, (w.end ?? now) - w.start - breakMs(w, w.end ?? now));
 }
 
 /** Leaves work without a trace. Only allowed in the first `CANCEL_MS` (also when locked). */

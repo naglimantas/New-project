@@ -26,3 +26,4 @@ Thumbs.db
 !.vscode/extensions.json
 
 # NOTE: CLAUDE.md and .claude/ are intentionally tracked (context is synced across PCs).
+e2e/fail-*.png

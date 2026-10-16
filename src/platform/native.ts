@@ -93,3 +93,15 @@ export function onNative(event: 'tray' | 'blocked', fn: (payload: string) => voi
 export function startedAtLogin(): Promise<boolean> {
   return call('started_at_login', {}, false);
 }
+
+/** Saves a text file to Downloads; returns where it went. In a browser the file is downloaded. */
+export async function saveFile(name: string, contents: string): Promise<string> {
+  if (isDesktop) return call('export_file', { name, contents }, '');
+  const url = URL.createObjectURL(new Blob(['\ufeff', contents], { type: 'text/csv;charset=utf-8' }));
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = name;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  return name;
+}

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { addTry, addUsage, atMinutes, cancelWork, canCancel, checkOut, dayKey, deleteSession, initialState, isLocked, markPrompted, schedulePrompt, setRules, startWork, suggestedGoal, topApps, CANCEL_MS, type State } from './model';
+import { addTry, addUsage, atMinutes, breakMs, endBreak, isOnBreak, settleBreak, startBreak, workedMs, cancelWork, canCancel, checkOut, dayKey, deleteSession, initialState, isLocked, markPrompted, schedulePrompt, setRules, startWork, suggestedGoal, topApps, CANCEL_MS, type State } from './model';
 import { addBlocked, addSite, normalizeExe, normalizeSite, siteKeys } from './programs';
 import { parseState } from './store';
 import { fmtClock, fmtDuration, lastDays, weekStart, weekSummary } from './stats';
@@ -253,5 +253,42 @@ describe('last days', () => {
     expect(days[6]).toMatchObject({ ms: 75 * MIN, sessions: 2, done: 1 });
     expect(days[5]).toMatchObject({ ms: 60 * MIN, sessions: 1, done: 1 });
     expect(days.slice(0, 5).every((d) => d.ms === 0)).toBe(true);
+  });
+});
+
+describe('breaks', () => {
+  it('runs a break, ends it by itself at its time, and leaves it out of work time', () => {
+    let s = startWork(initialState(T0), 'A', T0);
+    s = startBreak(s, 10, T0 + 30 * MIN);
+    expect(isOnBreak(s, T0 + 35 * MIN)).toBe(true);
+    expect(startBreak(s, 5, T0 + 31 * MIN)).toBe(s); // one at a time
+    expect(settleBreak(s, T0 + 39 * MIN)).toBe(s);
+    s = settleBreak(s, T0 + 45 * MIN);
+    expect(s.current?.onBreak).toBeNull();
+    expect(s.current?.breaks).toEqual([{ from: T0 + 30 * MIN, to: T0 + 40 * MIN }]);
+    s = checkOut(s, 'done', '', T0 + 60 * MIN);
+    expect(breakMs(s.log[0])).toBe(10 * MIN);
+    expect(workedMs(s.log[0], T0 + 99 * MIN)).toBe(50 * MIN);
+    expect(weekSummary(s.log, T0 + 61 * MIN).totalMs).toBe(50 * MIN);
+  });
+
+  it('can be ended early, and a check-out during a break ends it there', () => {
+    let s = startWork(initialState(T0), 'A', T0);
+    s = endBreak(startBreak(s, 15, T0 + 10 * MIN), T0 + 12 * MIN);
+    expect(s.current?.breaks).toEqual([{ from: T0 + 10 * MIN, to: T0 + 12 * MIN }]);
+    s = startBreak(s, 15, T0 + 20 * MIN);
+    expect(breakMs(s.current!, T0 + 25 * MIN)).toBe(7 * MIN);
+    s = checkOut(s, 'partly', '', T0 + 25 * MIN);
+    expect(s.log[0].breaks).toEqual([
+      { from: T0 + 10 * MIN, to: T0 + 12 * MIN },
+      { from: T0 + 20 * MIN, to: T0 + 25 * MIN },
+    ]);
+    expect(s.log[0].onBreak).toBeNull();
+    expect(workedMs(s.log[0], 0)).toBe(18 * MIN);
+  });
+
+  it('is saved and read back', () => {
+    const s = startBreak(startWork(initialState(T0), 'A', T0), 5, T0 + MIN);
+    expect(parseState(JSON.stringify(s), T0 + 2 * MIN).current?.onBreak).toEqual({ from: T0 + MIN, until: T0 + 6 * MIN });
   });
 });

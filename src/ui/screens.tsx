@@ -1,6 +1,8 @@
 import { useState, type ReactNode } from 'react';
 import {
   activeMs,
+  BREAKS,
+  breakMs,
   isLocked,
   MODE_NAME,
   MODES,
@@ -11,7 +13,9 @@ import {
   type Settings,
   type State,
   type WorkSession,
+  workedMs,
 } from '../core/model';
+import { streak } from '../core/export';
 import { addBlocked, addSite, shortName } from '../core/programs';
 import { fmtClock, fmtDay, fmtDuration, fmtTime, lastDays, weekSummary } from '../core/stats';
 import { isDesktop, openItem, pickFile, runningPrograms } from '../platform/native';
@@ -77,8 +81,23 @@ function Guide({ onClose }: { onClose: () => void }) {
   );
 }
 
-export function NowScreen({ s, now, onSwitch, onGuideDone }: { s: State; now: number; onSwitch: () => void; onGuideDone: () => void }) {
+export function NowScreen({
+  s,
+  now,
+  onSwitch,
+  onBreak,
+  onEndBreak,
+  onGuideDone,
+}: {
+  s: State;
+  now: number;
+  onSwitch: () => void;
+  onBreak: (min: number) => void;
+  onEndBreak: () => void;
+  onGuideDone: () => void;
+}) {
   const work = s.mode === 'work';
+  const brk = s.current?.onBreak ?? null;
   const rules = s.rules[s.mode];
   const locked = isLocked(s, now);
   const sc = s.settings.schedule;
@@ -102,10 +121,39 @@ export function NowScreen({ s, now, onSwitch, onGuideDone }: { s: State; now: nu
             Focus lock until {fmtTime(s.current.lockUntil)} ({fmtDuration(s.current.lockUntil - now)} left).
           </p>
         )}
+        {work && !brk && (
+          <div className="break-row">
+            <span className="dim small">Break:</span>
+            {BREAKS.map((m) => (
+              <button key={m} className="btn sm" onClick={() => onBreak(m)} title={`Nothing is blocked for ${m} minutes, then work goes on`}>
+                {m} min
+              </button>
+            ))}
+          </div>
+        )}
       </Panel>
 
+      {brk && (
+        <Panel title="ON BREAK" className="break">
+          <div className="mode-head">
+            <div className="dim">
+              Nothing is blocked or measured.
+              <br />
+              Work goes on at {fmtTime(brk.until)}.
+            </div>
+            <div className="clock">{fmtClock(brk.until - now)}</div>
+          </div>
+          <button className="btn" onClick={onEndBreak}>
+            END BREAK NOW
+          </button>
+        </Panel>
+      )}
+
       {work && s.current && (
-        <Panel title="GOAL" right={`${fmtDuration(activeMs(s.current.usage))} at the PC`}>
+        <Panel
+          title="GOAL"
+          right={`${fmtDuration(activeMs(s.current.usage))} at the PC${breakMs(s.current, now) ? ` · ${fmtDuration(breakMs(s.current, now))} break` : ''}`}
+        >
           <p className="goal">{s.current.goal}</p>
           <UsageList usage={s.current.usage} />
           <Tries tries={s.current.tries} />
@@ -445,9 +493,11 @@ function WeekChart({ log, now }: { log: WorkSession[]; now: number }) {
   );
 }
 
-export function LogScreen({ s, now, onDelete }: { s: State; now: number; onDelete: (id: string) => void }) {
+export function LogScreen({ s, now, onDelete, onExport }: { s: State; now: number; onDelete: (id: string) => void; onExport: () => void }) {
   const [confirm, setConfirm] = useState<string | null>(null);
   const w = weekSummary(s.log, now);
+  const sc = s.settings.schedule;
+  const streakDays = streak(s.log, now, sc.on ? sc.days : [1, 2, 3, 4, 5]);
   const days: { day: string; list: WorkSession[] }[] = [];
   for (const x of s.log) {
     const day = fmtDay(x.start);
@@ -473,6 +523,10 @@ export function LogScreen({ s, now, onDelete }: { s: State; now: number; onDelet
               <span>at the PC</span>
             </div>
             <div>
+              <b>{streakDays}</b>
+              <span>day{streakDays === 1 ? '' : 's'} in a row done</span>
+            </div>
+            <div>
               <b>{w.score === null ? '–' : `${Math.round(w.score * 100)}%`}</b>
               <span>
                 {w.outcomes.done} done · {w.outcomes.partly} partly · {w.outcomes.not} not
@@ -487,7 +541,16 @@ export function LogScreen({ s, now, onDelete }: { s: State; now: number; onDelet
       <Panel title="WORK PER DAY · LAST 7 DAYS">
         <WeekChart log={s.log} now={now} />
       </Panel>
-      <Panel title="SESSIONS">
+      <Panel
+        title="SESSIONS"
+        right={
+          s.log.length > 0 && (
+            <button className="btn sm ghost" onClick={onExport} title="Save every session as a CSV file in Downloads">
+              EXPORT CSV
+            </button>
+          )
+        }
+      >
         {!days.length && <p className="dim">Sessions show here after their check-out.</p>}
         {days.map((d) => (
           <div key={d.day} className="day">
@@ -496,7 +559,8 @@ export function LogScreen({ s, now, onDelete }: { s: State; now: number; onDelet
               <article key={x.id} className="entry">
                 <div className="entry-head">
                   <span className="dim">
-                    {fmtTime(x.start)}–{fmtTime(x.end ?? x.start)} · {fmtDuration((x.end ?? x.start) - x.start)}
+                    {fmtTime(x.start)}–{fmtTime(x.end ?? x.start)} · {fmtDuration(workedMs(x, x.end ?? x.start))}
+                    {breakMs(x) > 0 && ` + ${fmtDuration(breakMs(x))} break`}
                   </span>
                   <span className="entry-tools">
                     <span className={`tag ${x.outcome}`}>{x.outcome ? OUTCOME_NAME[x.outcome] : ''}</span>

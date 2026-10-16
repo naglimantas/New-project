@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { activeMs, GOAL_MAX, LOCKS, MODE_NAME, OUTCOME_NAME, type ModeId, type Outcome, type State } from '../core/model';
+import { activeMs, breakMs, GOAL_MAX, workedMs, LOCKS, MODE_NAME, OUTCOME_NAME, type ModeId, type Outcome, type State } from '../core/model';
 import { shortName } from '../core/programs';
 import { fmtDuration, fmtTime } from '../core/stats';
 import { runningBlocked } from '../platform/native';
@@ -157,7 +157,7 @@ export function CheckOutDialog({
       <p className="label">GOAL</p>
       <p className="goal">{w.goal}</p>
       <p className="dim small">
-        {fmtDuration(now - w.start)} since start · {fmtDuration(activeMs(w.usage))} at the PC
+        {fmtDuration(workedMs(w, now))} worked{breakMs(w, now) ? ` · ${fmtDuration(breakMs(w, now))} break` : ''} · {fmtDuration(activeMs(w.usage))} at the PC
       </p>
       <p className="label">WHERE THE TIME WENT</p>
       <UsageList usage={w.usage} />

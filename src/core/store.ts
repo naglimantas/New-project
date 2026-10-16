@@ -57,6 +57,10 @@ function readSession(x: unknown, finished: boolean): WorkSession | null {
     usage: readCounts(x.usage),
     tries: readCounts(x.tries),
     lockUntil: !finished && num(x.lockUntil) ? x.lockUntil : null,
+    breaks: Array.isArray(x.breaks)
+      ? x.breaks.filter((b): b is { from: number; to: number } => isObj(b) && num(b.from) && num(b.to) && b.to > b.from).map((b) => ({ from: b.from, to: b.to }))
+      : [],
+    onBreak: !finished && isObj(x.onBreak) && num(x.onBreak.from) && num(x.onBreak.until) && x.onBreak.until > x.onBreak.from ? { from: x.onBreak.from, until: x.onBreak.until } : null,
   };
 }
 

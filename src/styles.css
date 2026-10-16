@@ -763,3 +763,18 @@ input::placeholder {
   align-items: center;
   gap: 4px;
 }
+
+/* ───────── round 3: breaks ───────── */
+.break-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 10px;
+  flex-wrap: wrap;
+}
+.panel.break {
+  border-top: 2px solid var(--free);
+}
+.panel.break .clock {
+  color: var(--free);
+}

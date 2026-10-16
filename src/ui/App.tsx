@@ -6,11 +6,14 @@ import {
   canCancel,
   checkOut,
   deleteSession,
+  endBreak,
   isLocked,
   markPrompted,
   MODE_NAME,
   schedulePrompt,
   setRules,
+  settleBreak,
+  startBreak,
   startWork,
   suggestedGoal,
   type ModeId,
@@ -19,7 +22,9 @@ import {
 } from '../core/model';
 import { shortName, siteKeys } from '../core/programs';
 import { loadState, saveState } from '../core/store';
-import { notify, onNative, openItem, setAutostart, setMode, showWindow, startedAtLogin, takeUsage } from '../platform/native';
+import { notify, onNative, openItem, saveFile, setAutostart, setMode, showWindow, startedAtLogin, takeUsage } from '../platform/native';
+import { toCsv } from '../core/export';
+import { fmtTime } from '../core/stats';
 import { CheckOutDialog, StartWorkDialog } from './dialogs';
 import { toast, Toasts } from './kit';
 import { LogScreen, NowScreen, RulesScreen } from './screens';
@@ -42,9 +47,10 @@ function openStartup(s: State, mode: ModeId) {
   }
 }
 
-/** The tray's first line: the mode, and during work the goal. */
+/** The tray's first line: the mode, and during work the goal (or the break). */
 function trayStatus(s: State): string {
-  return s.mode === 'work' && s.current ? `WORK: ${s.current.goal}` : MODE_NAME[s.mode];
+  if (s.mode !== 'work' || !s.current) return MODE_NAME[s.mode];
+  return s.current.onBreak ? `WORK: on break until ${fmtTime(s.current.onBreak.until)}` : `WORK: ${s.current.goal}`;
 }
 
 export function App() {
@@ -61,15 +67,27 @@ export function App() {
   useEffect(() => saveState(s), [s]);
 
   // Windows follows the mode: what to block, whether to count program time, what the tray says.
+  // During a break nothing is blocked or measured.
   const rules = s.rules[s.mode];
-  const blockedKey = rules.blocked.join('|');
-  const sitesKey = rules.sites.join('|');
+  const onBreak = !!s.current?.onBreak;
+  const blockedKey = onBreak ? '' : rules.blocked.join('|');
+  const sitesKey = onBreak ? '' : rules.sites.join('|');
   const status = trayStatus(s);
   useEffect(() => {
     const blocked = blockedKey ? blockedKey.split('|') : [];
     const sites = sitesKey ? sitesKey.split('|').flatMap(siteKeys) : [];
-    setMode(s.mode, MODE_NAME[s.mode], status, blocked, sites, s.mode === 'work').catch((e) => toast(`Windows side: ${String(e)}`, 'warn'));
-  }, [s.mode, blockedKey, sitesKey, status]);
+    setMode(s.mode, MODE_NAME[s.mode], status, blocked, sites, s.mode === 'work' && !onBreak).catch((e) => toast(`Windows side: ${String(e)}`, 'warn'));
+  }, [s.mode, blockedKey, sitesKey, status, onBreak]);
+
+  // A break whose time is up ends by itself, and says so.
+  useEffect(() => {
+    const b = latest.current.current?.onBreak;
+    if (!b || now < b.until) return;
+    setS((x) => settleBreak(x, now));
+    const goal = latest.current.current?.goal ?? '';
+    toast('Break over. Blocking is on again.');
+    void notify('Break over', `Back to: ${goal}`).catch(() => {});
+  }, [now]);
 
   useEffect(() => {
     setAutostart(s.settings.autostart).catch(() => {});
@@ -146,6 +164,29 @@ export function App() {
     setS(after);
     toast(outcome === 'skipped' ? 'Work ended without a check-out.' : `Work ended: ${outcome === 'done' ? 'done.' : outcome === 'partly' ? 'partly done.' : 'not done.'}`);
     openStartup(after, 'free');
+  };
+
+  const doBreak = (min: number) => {
+    // Time before the break belongs to the work.
+    void flushUsage();
+    setS((x) => startBreak(x, min, Date.now()));
+    toast(`Break for ${min} minutes. Nothing is blocked until it ends.`);
+  };
+
+  const doEndBreak = () => {
+    setS((x) => endBreak(x, Date.now()));
+    toast('Back to work. Blocking is on again.');
+  };
+
+  const doExport = async () => {
+    const d = new Date();
+    const name = `modes-log-${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}.csv`;
+    try {
+      const where = await saveFile(name, toCsv(latest.current.log));
+      toast(`Saved ${where}`, 'info', 8000);
+    } catch (e) {
+      toast(`Could not save the file: ${String(e)}`, 'warn', 8000);
+    }
   };
 
   const doCancel = () => {
@@ -229,12 +270,24 @@ export function App() {
             {t.name}
           </button>
         ))}
-        <span className={`mode-tag ${s.mode}`}>{MODE_NAME[s.mode]}</span>
+        <span className={`mode-tag ${s.mode}`}>
+          {MODE_NAME[s.mode]}
+          {onBreak ? ' · BREAK' : ''}
+        </span>
       </nav>
       <main>
-        {tab === 'now' && <NowScreen s={s} now={now} onSwitch={onSwitch} onGuideDone={() => setS((x) => ({ ...x, guideDone: true }))} />}
+        {tab === 'now' && (
+          <NowScreen
+            s={s}
+            now={now}
+            onSwitch={onSwitch}
+            onBreak={doBreak}
+            onEndBreak={doEndBreak}
+            onGuideDone={() => setS((x) => ({ ...x, guideDone: true }))}
+          />
+        )}
         {tab === 'rules' && <RulesScreen s={s} onRules={(m, r) => setS((x) => setRules(x, m, r))} onSettings={(st) => setS((x) => ({ ...x, settings: st }))} />}
-        {tab === 'log' && <LogScreen s={s} now={now} onDelete={(id) => setS((x) => deleteSession(x, id))} />}
+        {tab === 'log' && <LogScreen s={s} now={now} onDelete={(id) => setS((x) => deleteSession(x, id))} onExport={() => void doExport()} />}
       </main>
       {dialog === 'start' && s.mode === 'free' && <StartWorkDialog s={s} suggestion={suggestedGoal(s)} onStart={doStart} onClose={() => setDialog(null)} />}
       {dialog === 'checkout' && s.mode === 'work' && (

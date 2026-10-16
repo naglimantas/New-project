@@ -1,6 +1,6 @@
 // Summaries for the LOG screen and text formatting.
 
-import { activeMs, type Outcome, type WorkSession } from './model';
+import { activeMs, workedMs, type Outcome, type WorkSession } from './model';
 
 /** Monday 00:00 (local time) of the week `t` falls in. */
 export function weekStart(t: number): number {
@@ -12,7 +12,7 @@ export function weekStart(t: number): number {
 
 export interface WeekSummary {
   sessions: number;
-  /** Time from start to check-out, all sessions. */
+  /** Time from start to check-out without breaks, all sessions. */
   totalMs: number;
   /** Time at the PC (a program in front, not idle). */
   activeMs: number;
@@ -31,7 +31,7 @@ export function weekSummary(log: WorkSession[], now: number): WeekSummary {
   for (const w of log) {
     if (w.start < from || w.start > now || w.end === null || w.outcome === null) continue;
     sessions++;
-    totalMs += w.end - w.start;
+    totalMs += workedMs(w, w.end);
     active += activeMs(w.usage);
     outcomes[w.outcome]++;
   }
@@ -76,7 +76,7 @@ export function fmtDay(t: number): string {
 export interface DayBar {
   /** Local midnight. */
   day: number;
-  /** Work time (start to check-out) of sessions that started that day. */
+  /** Work time (start to check-out, without breaks) of sessions that started that day. */
   ms: number;
   sessions: number;
   done: number;
@@ -99,7 +99,7 @@ export function lastDays(log: WorkSession[], now: number, n = 7): DayBar[] {
     let k = out.length - 1;
     while (k > 0 && out[k].day > w.start) k--;
     const b = out[k];
-    b.ms += w.end - w.start;
+    b.ms += workedMs(w, w.end);
     b.sessions++;
     if (w.outcome === 'done') b.done++;
   }

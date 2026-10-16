@@ -14,6 +14,7 @@ mod win;
 
 use rules::{Action, Enforcer, SiteGuard, Tally, IDLE_MS};
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -92,6 +93,49 @@ fn set_mode(
 #[tauri::command]
 fn notify(app: AppHandle, title: String, body: String) {
     let _ = app.notification().builder().title(&title).body(&body).show();
+}
+
+fn sanitize(name: &str) -> String {
+    let s: String = name
+        .chars()
+        .filter(|&c| !matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') && !c.is_control())
+        .collect();
+    if s.trim().is_empty() {
+        "modes-export.txt".into()
+    } else {
+        s
+    }
+}
+
+/// `name.ext`, or `name (1).ext`, `name (2).ext`… if the file already exists.
+fn free_path(dir: &Path, name: &str) -> PathBuf {
+    let first = dir.join(name);
+    if !first.exists() {
+        return first;
+    }
+    let p = Path::new(name);
+    let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("export");
+    let ext = p.extension().and_then(|s| s.to_str());
+    (1..)
+        .map(|n| match ext {
+            Some(e) => dir.join(format!("{stem} ({n}).{e}")),
+            None => dir.join(format!("{stem} ({n})")),
+        })
+        .find(|p| !p.exists())
+        .unwrap_or(first)
+}
+
+/// Writes an export to the Downloads folder (with a byte order mark, so Excel reads UTF-8) and
+/// returns the full path.
+#[tauri::command]
+fn export_file(app: AppHandle, name: String, contents: String) -> Result<String, String> {
+    let dir = app.path().download_dir().or_else(|_| app.path().document_dir()).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = free_path(&dir, &sanitize(&name));
+    let mut bytes = vec![0xEF, 0xBB, 0xBF];
+    bytes.extend_from_slice(contents.as_bytes());
+    std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+    Ok(path.display().to_string())
 }
 
 /// Brings the window forward (the schedule asks something).
@@ -384,7 +428,8 @@ pub fn run() {
             set_autostart,
             started_at_login,
             notify,
-            show_window
+            show_window,
+            export_file
         ])
         .setup(|app| {
             setup_tray(app.handle())?;
@@ -413,4 +458,31 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running Modes");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn export_names_are_safe_and_never_overwrite() {
+        assert_eq!(sanitize("modes-log-2026-10-16.csv"), "modes-log-2026-10-16.csv");
+        assert_eq!(sanitize(r#"a/b\c:d*e?f"g<h>i|j.csv"#), "abcdefghij.csv");
+        assert_eq!(sanitize("  "), "modes-export.txt");
+        let dir = std::env::temp_dir().join(format!("modes-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(free_path(&dir, "log.csv"), dir.join("log.csv"));
+        std::fs::write(dir.join("log.csv"), "x").unwrap();
+        assert_eq!(free_path(&dir, "log.csv"), dir.join("log (1).csv"));
+        std::fs::write(dir.join("log (1).csv"), "x").unwrap();
+        assert_eq!(free_path(&dir, "log.csv"), dir.join("log (2).csv"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn menu_text_is_short_and_shows_ampersands() {
+        assert_eq!(menu_text("WORK: R&D"), "WORK: R&&D");
+        let long = "x".repeat(80);
+        assert_eq!(menu_text(&long).chars().count(), 60);
+    }
 }
