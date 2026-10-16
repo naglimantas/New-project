@@ -38,7 +38,10 @@ function fakeTauri() {
       if (cmd === 'plugin:event|unlisten') return null;
       if (cmd === 'running_blocked') return args.names.filter((x) => x === 'steam.exe');
       if (cmd === 'running_programs') return ['code.exe', 'steam.exe', 'spotify.exe'];
-      if (cmd === 'take_usage') return { 'code.exe': 9000 };
+      if (cmd === 'take_usage') {
+        if (window.__slowTake) await new Promise((r) => setTimeout(r, window.__slowTake));
+        return { 'code.exe': 9000 };
+      }
       if (cmd === 'started_at_login') return false;
       if (cmd === 'export_file') return `C:\\Users\\me\\Downloads\\${args.name}`;
       if (cmd === 'load_backup') return window.__backup ?? null;
@@ -136,6 +139,20 @@ await scenario('start, rules lock, check out, next goal', {}, async (p) => {
   assert.equal(s.log[0].next, 'Proofread and publish');
   await p.getByText('START WORK…').click();
   assert.equal(await p.getByPlaceholder(GOAL).inputValue(), 'Proofread and publish', 'next step offered as goal');
+});
+
+await scenario('a try that arrives during check-out is kept', {}, async (p) => {
+  await startWork(p, 'Racy');
+  await p.clock.runFor(3 * MIN);
+  await p.getByText('END WORK…').click();
+  await p.getByRole('radio', { name: 'Done', exact: true }).click();
+  // Check-out waits for the last program time; a blocked program is reported meanwhile.
+  await p.evaluate(() => (window.__slowTake = 500));
+  await dialog(p, 'END WORK').locator('.wfoot .btn.primary').click();
+  await p.evaluate(() => window.__emit('blocked', 'steam.exe'));
+  await p.clock.runFor(600);
+  await p.locator('.mode-tag.free').waitFor();
+  assert.deepEqual((await saved(p)).log[0].tries, { 'steam.exe': 1 });
 });
 
 await scenario('a mistaken start is cancelled without a log entry', {}, async (p) => {

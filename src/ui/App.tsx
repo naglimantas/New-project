@@ -159,12 +159,13 @@ export function App() {
   }, []);
 
   const doStart = (goal: string, lockMin: number) => {
-    const next = startWork(latest.current, goal, Date.now(), lockMin);
+    const t = Date.now();
+    const next = startWork(latest.current, goal, t, lockMin);
     if (next === latest.current) return;
     // Time measured before work started is not part of it.
     void takeUsage().catch(() => {});
-    latest.current = next;
-    setS(next);
+    // Applied to the newest state, so an update still on its way is not lost.
+    setS((x) => startWork(x, goal, t, lockMin));
     setDialog(null);
     openStartup(next, 'work');
   };
@@ -181,16 +182,17 @@ export function App() {
       // Without the last seconds; nothing else is lost.
     }
     checkingOut.current = false;
+    const t = Date.now();
     const before = latest.current;
-    const after = checkOut(addUsage(before, delta), outcome, next, Date.now());
+    const after = checkOut(addUsage(before, delta), outcome, next, t);
     if (after.mode !== 'free') {
       // Still locked (or not in work): keep the measured time, end nothing.
       if (before.mode === 'work') setS((x) => addUsage(x, delta));
       return;
     }
     setDialog(null);
-    latest.current = after;
-    setS(after);
+    // Applied to the newest state, so a try or program time still on its way is kept.
+    setS((x) => checkOut(addUsage(x, delta), outcome, next, t));
     toast(outcome === 'skipped' ? 'Work ended without a check-out.' : `Work ended: ${outcome === 'done' ? 'done.' : outcome === 'partly' ? 'partly done.' : 'not done.'}`);
     openStartup(after, 'free');
   };
