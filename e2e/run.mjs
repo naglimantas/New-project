@@ -10,7 +10,7 @@ import assert from 'node:assert/strict';
 import { chromium } from 'playwright-core';
 import { preview } from 'vite';
 
-const PORT = 4174;
+const PORT = Number(process.env.E2E_PORT) || 4174;
 const URL = `http://localhost:${PORT}/`;
 const MIN = 60_000;
 const GOAL = 'e.g. Finish the sync conflict fix';
@@ -78,6 +78,16 @@ async function scenario(name, { tauri = true, time = new Date(2026, 9, 14, 8, 58
 
 const calls = (p, cmd) => p.evaluate((c) => window.__calls.filter((x) => x[0] === c).map((x) => x[1]), cmd);
 const lastMode = async (p) => (await calls(p, 'set_mode')).at(-1);
+/** The latest `set_mode` once it matches `ok`: React sends it after the click's render, so wait for it. */
+async function modeWhere(p, ok, what) {
+  const until = Date.now() + 5000;
+  for (;;) {
+    const m = await lastMode(p);
+    if (m && ok(m)) return m;
+    if (Date.now() > until) assert.fail(`set_mode never became: ${what}; last was ${JSON.stringify(m)}`);
+    await new Promise((r) => setTimeout(r, 50));
+  }
+}
 const saved = (p) => p.evaluate(() => JSON.parse(localStorage.getItem('modes-state')));
 const tab = (p, name) => p.getByRole('tab', { name }).click();
 const dialog = (p, title) => p.locator(`[role=dialog][aria-label="${title}"]`);
@@ -95,7 +105,7 @@ await scenario('start, rules lock, check out, next goal', {}, async (p) => {
   await startWork(p, 'Write the release notes');
   // Regression: the Enter that starts work must not also press END WORK.
   assert.equal(await p.getByRole('dialog').count(), 0, 'no dialog after starting with Enter');
-  const m = await lastMode(p);
+  const m = await modeWhere(p, (m) => m.mode === 'work', 'work');
   assert.equal(m.mode, 'work');
   assert.equal(m.tracking, true);
   assert.equal(m.status, 'WORK: Write the release notes');
@@ -151,7 +161,7 @@ await scenario('work hours, focus lock, tries, hotkey', {}, async (p) => {
   await p.getByPlaceholder(GOAL).fill('Ship it');
   await p.getByRole('button', { name: 'START WORK', exact: true }).click();
   await p.getByText('Focus lock until').waitFor();
-  assert.deepEqual((await lastMode(p)).sites, ['youtube.com', 'youtube']);
+  await modeWhere(p, (m) => m.mode === 'work' && m.sites.join() === 'youtube.com,youtube', 'work with the youtube keys');
 
   await p.evaluate(() => ['steam.exe', 'youtube', 'steam.exe'].forEach((n) => window.__emit('blocked', n)));
   await p.getByText('Blocked 3× during work').waitFor();
@@ -186,7 +196,7 @@ await scenario('breaks pause blocking and end by themselves', {}, async (p) => {
   await startWork(p, 'Deep work');
   await p.getByRole('button', { name: '10 min', exact: true }).click();
   await p.getByText('ON BREAK').waitFor();
-  let m = await lastMode(p);
+  let m = await modeWhere(p, (m) => m.resume, 'a break');
   assert.deepEqual([m.blocked, m.sites, m.tracking], [[], [], false], 'nothing blocked or measured on a break');
   assert.match(m.status, /on break until/);
   // Windows is told what to put back, and when, so it happens on time even with this page asleep.
@@ -195,8 +205,7 @@ await scenario('breaks pause blocking and end by themselves', {}, async (p) => {
   assert.equal(m.resume.at, (await saved(p)).current.onBreak.until);
   await p.clock.runFor(10 * MIN + 2000);
   await p.getByText('Break over').first().waitFor();
-  m = await lastMode(p);
-  assert.equal(m.resume, null, 'resume cleared after the break');
+  m = await modeWhere(p, (m) => !m.resume, 'the break over');
   assert.equal(m.tracking, true);
   assert.ok(m.blocked.includes('steam.exe'), 'blocking back on');
   await p.getByRole('button', { name: '5 min', exact: true }).click();
@@ -254,9 +263,11 @@ await scenario('cleared storage comes back from the backup file', { backup: BACK
 });
 
 await scenario('a fresh start never overwrites the backup before reading it', {}, async (p) => {
+  await p.waitForFunction(() => window.__calls.some((c) => c[0] === 'load_backup'));
   await p.clock.runFor(3000);
+  await p.waitForFunction(() => window.__calls.some((c) => c[0] === 'save_backup'));
   const order = await p.evaluate(() => window.__calls.map((c) => c[0]).filter((c) => c === 'load_backup' || c === 'save_backup'));
-  assert.equal(order[0], 'load_backup');
+  assert.equal(order[0], 'load_backup', 'read before any write');
 });
 
 await scenario('log: chart, streak, export, delete', {}, async (p) => {
